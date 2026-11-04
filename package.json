@@ -1,0 +1,25 @@
+{
+  "name": "btq-swap",
+  "version": "0.1.0",
+  "private": true,
+  "description": "BTQ HTLC Atomic Swap Platform — BTQ ⇄ USDT",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:backend": "npm run dev -w packages/backend",
+    "dev:frontend": "npm run dev -w packages/frontend",
+    "build:backend": "npm run build -w packages/backend",
+    "build:frontend": "npm run build -w packages/frontend",
+    "build:contracts": "npm run compile -w packages/contracts",
+    "test:contracts": "npm run test -w packages/contracts",
+    "test:backend": "npm run test -w packages/backend",
+    "migrate": "npm run migrate -w packages/backend",
+    "docker:up": "docker compose up --build -d",
+    "docker:logs": "docker compose logs -f",
+    "docker:down": "docker compose down"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

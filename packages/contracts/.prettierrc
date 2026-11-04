@@ -1,0 +1,20 @@
+{
+	"tabWidth": 1,
+	"useTabs": true,
+	"overrides": [
+		{
+			"files": "*.sol",
+			"options": {
+				"tabWidth": 1,
+				"useTabs": true
+			}
+		},
+		{
+			"files": ["*.ts", "*.tsx"],
+			"options": {
+				"tabWidth": 1,
+				"useTabs": true
+			}
+		}
+	]
+}

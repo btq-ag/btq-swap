@@ -1,0 +1,12 @@
+node_modules
+**/node_modules
+dist
+**/dist
+.git
+.env
+*.log
+coverage
+packages/contracts/artifacts
+packages/contracts/cache
+packages/contracts/typechain-types
+**/.DS_Store
