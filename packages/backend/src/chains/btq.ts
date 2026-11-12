@@ -103,16 +103,26 @@ export class BtqChain {
     return this.platform.call<string>('sendtoaddress', [address, satsToBtq(sats), comment]);
   }
 
+  /** Load or create a wallet; safe when several processes race to do the same. */
   async ensureWallet(name: string): Promise<BtqRpc> {
-    const loaded = await this.rpc.call<string[]>('listwallets');
-    if (!loaded.includes(name)) {
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const loaded = await this.rpc.call<string[]>('listwallets');
+      if (loaded.includes(name)) return this.wallet(name);
       try {
         await this.rpc.call('loadwallet', [name]);
-      } catch {
-        await this.rpc.call('createwallet', [name]);
+        return this.wallet(name);
+      } catch (e) {
+        if (/already loaded/i.test((e as Error).message)) return this.wallet(name);
       }
+      try {
+        await this.rpc.call('createwallet', [name]);
+        return this.wallet(name);
+      } catch (e) {
+        if (!/already exists|already loaded/i.test((e as Error).message)) throw e;
+      }
+      await new Promise((r) => setTimeout(r, 300 + attempt * 200));
     }
-    return this.wallet(name);
+    throw new Error(`could not load or create wallet ${name}`);
   }
 }
 

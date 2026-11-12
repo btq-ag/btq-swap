@@ -11,10 +11,12 @@ async function main(): Promise<void> {
   const btq = btqChain();
   for (;;) {
     try {
+      // Alternate coinbase between the MM inventory and the devnet faucet so both keep growing.
       const w = await btq.ensureWallet(c.BTQ_PLATFORM_WALLET);
-      const addr = await w.call<string>('getnewaddress', ['coinbase']);
-      for (;;) {
-        await w.call('generatetoaddress', [1, addr]);
+      const f = await btq.ensureWallet('faucet');
+      const addrs = [await w.call<string>('getnewaddress', ['coinbase']), await f.call<string>('getnewaddress', ['coinbase'])];
+      for (let n = 0; ; n++) {
+        await w.call('generatetoaddress', [1, addrs[n % 2]]);
         const tip = await btq.tip();
         if (tip.height % 20 === 0) log.info('block', { height: tip.height });
         await new Promise((r) => setTimeout(r, c.BTQ_TARGET_BLOCK_SEC * 1000));

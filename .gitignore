@@ -14,3 +14,5 @@ sim-reports/
 .btq-htlc/
 deploy/.env*
 !deploy/.env.example
+deploy/btqd/bin/
+packages/backend/.env.legacy.bak

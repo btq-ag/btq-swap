@@ -3,32 +3,57 @@
 @tailwind utilities;
 
 @layer base {
+  html {
+    background: #0e1525;
+    color: #e6eaf2;
+    color-scheme: dark;
+    -webkit-font-smoothing: antialiased;
+  }
+  body {
+    font-family: 'Instrument Sans', ui-sans-serif, system-ui, sans-serif;
+    font-size: 15px;
+    line-height: 1.5;
+  }
   * {
     scrollbar-width: thin;
-    scrollbar-color: #334155 transparent;
+    scrollbar-color: #2e3b5a transparent;
   }
+  :focus-visible {
+    outline: 2px solid #f5c451;
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+}
 
-  *::-webkit-scrollbar {
-    width: 6px;
-    height: 6px;
+@layer components {
+  .hash {
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+    font-size: 12px;
+    letter-spacing: -0.01em;
   }
+  .panel {
+    background: #151e33;
+    border: 1px solid #24304b;
+    border-radius: 14px;
+  }
+}
 
-  *::-webkit-scrollbar-track {
-    background: transparent;
-  }
-
-  *::-webkit-scrollbar-thumb {
-    background-color: #334155;
-    border-radius: 9999px;
-  }
-
-  input[type='number']::-webkit-inner-spin-button,
-  input[type='number']::-webkit-outer-spin-button {
-    -webkit-appearance: none;
-    margin: 0;
-  }
-
-  input[type='number'] {
-    -moz-appearance: textfield;
-  }
+/* The secret crossing from the BTQ lane to the EVM lane: the one animated moment. */
+@keyframes key-cross {
+  0% { transform: translateY(0); opacity: 0; }
+  20% { opacity: 1; }
+  100% { transform: translateY(-26px); opacity: 1; }
+}
+.key-cross {
+  animation: key-cross 900ms ease-out both;
+}
+@keyframes pulse-dot {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(56, 189, 248, 0.5); }
+  50% { box-shadow: 0 0 0 6px rgba(56, 189, 248, 0); }
+}
+.pulse-dot {
+  animation: pulse-dot 1.8s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .key-cross, .pulse-dot { animation: none; }
 }

@@ -1,25 +1,22 @@
 import type { Config } from 'tailwindcss';
 
 export default {
-  content: ['./index.html', './src/**/*.{js,ts,jsx,tsx}'],
+  content: ['./index.html', './src/**/*.{ts,tsx}'],
   theme: {
     extend: {
       colors: {
-        brand: {
-          50: '#eff6ff',
-          100: '#dbeafe',
-          200: '#bfdbfe',
-          300: '#93c5fd',
-          400: '#60a5fa',
-          500: '#3B82F6',
-          600: '#2563eb',
-          700: '#1d4ed8',
-          800: '#1e40af',
-          900: '#1e3a8a',
-        },
+        ink: { DEFAULT: '#0E1525', 2: '#151E33', 3: '#1B2640', line: '#24304B', soft: '#2E3B5A' },
+        fog: { DEFAULT: '#E6EAF2', 2: '#B7C0D3', 3: '#8C97AE', 4: '#5F6A82' },
+        btq: { DEFAULT: '#A78BFA', dim: '#6D5BC4', glow: '#C4B5FD' },
+        evm: { DEFAULT: '#38BDF8', dim: '#2381AD', glow: '#7DD3FC' },
+        key: { DEFAULT: '#F5C451', dim: '#B8902F' },
+        ok: '#34D399',
+        warn: '#F59E0B',
+        bad: '#F87171',
       },
-      animation: {
-        'pulse-slow': 'pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite',
+      fontFamily: {
+        sans: ['"Instrument Sans"', 'ui-sans-serif', 'system-ui', 'sans-serif'],
+        mono: ['"JetBrains Mono"', 'ui-monospace', 'SFMono-Regular', 'monospace'],
       },
     },
   },

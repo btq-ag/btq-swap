@@ -1,57 +1,50 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
-import { RouterProvider } from 'react-router-dom';
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { WagmiProvider } from 'wagmi';
-import { RainbowKitProvider, darkTheme } from '@rainbow-me/rainbowkit';
-import { Toaster } from 'react-hot-toast';
-import { router } from './App';
-import { wagmiConfig } from './lib/wagmi';
-import { ErrorDetailProvider } from './components/common/ErrorToast';
-import '@rainbow-me/rainbowkit/styles.css';
+import { createBrowserRouter, NavLink, Outlet, RouterProvider } from 'react-router-dom';
+import { AdminPage } from './pages/Admin';
+import { MonitorPage } from './pages/Monitor';
+import { SwapPage } from './pages/SwapPage';
 import './index.css';
 
-const queryClient = new QueryClient({
-  defaultOptions: {
-    queries: {
-      retry: 1,
-      refetchOnWindowFocus: false,
-    },
+function Shell() {
+  const link = ({ isActive }: { isActive: boolean }) => `rounded-md px-3 py-1.5 text-sm ${isActive ? 'bg-ink-3 text-fog' : 'text-fog-3 hover:text-fog-2'}`;
+  return (
+    <div className="min-h-screen">
+      <nav className="border-b border-ink-line bg-ink/90 backdrop-blur">
+        <div className="mx-auto flex max-w-7xl items-center justify-between px-5 py-3">
+          <NavLink to="/" className="flex items-center gap-2.5 font-semibold text-fog">
+            <svg width="22" height="22" viewBox="0 0 32 32" aria-hidden>
+              <path d="M5 10h22M5 22h22" stroke="#38BDF8" strokeWidth="3" strokeLinecap="round" />
+              <path d="M5 22h22" stroke="#A78BFA" strokeWidth="3" strokeLinecap="round" />
+              <circle cx="16" cy="16" r="4" fill="#F5C451" />
+            </svg>
+            BTQ Swap
+          </NavLink>
+          <div className="flex items-center gap-1">
+            <NavLink to="/" end className={link}>Monitor</NavLink>
+            <NavLink to="/admin" className={link}>Operator</NavLink>
+            <a href="/downloads/btq-htlc.mjs" className="rounded-md px-3 py-1.5 text-sm text-fog-3 hover:text-fog-2">btq-htlc tool</a>
+          </div>
+        </div>
+      </nav>
+      <Outlet />
+    </div>
+  );
+}
+
+const router = createBrowserRouter([
+  {
+    element: <Shell />,
+    children: [
+      { index: true, element: <MonitorPage /> },
+      { path: 'swap/:id', element: <SwapPage /> },
+      { path: 'admin', element: <AdminPage /> },
+    ],
   },
-});
+]);
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
-    <WagmiProvider config={wagmiConfig}>
-      <QueryClientProvider client={queryClient}>
-        <RainbowKitProvider
-          theme={darkTheme({
-            accentColor: '#3B82F6',
-            accentColorForeground: 'white',
-            borderRadius: 'medium',
-            overlayBlur: 'small',
-          })}
-        >
-          <ErrorDetailProvider>
-            <RouterProvider router={router} />
-          </ErrorDetailProvider>
-          <Toaster
-            position="bottom-center"
-            toastOptions={{
-              duration: 4000,
-              style: {
-                background: '#1e293b',
-                color: '#f1f5f9',
-                border: '1px solid #334155',
-                borderRadius: '12px',
-                fontSize: '14px',
-              },
-              success: { iconTheme: { primary: '#10b981', secondary: '#f1f5f9' } },
-              error: { iconTheme: { primary: '#ef4444', secondary: '#f1f5f9' } },
-            }}
-          />
-        </RainbowKitProvider>
-      </QueryClientProvider>
-    </WagmiProvider>
-  </React.StrictMode>
+    <RouterProvider router={router} />
+  </React.StrictMode>,
 );

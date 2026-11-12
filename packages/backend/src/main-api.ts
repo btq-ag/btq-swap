@@ -12,6 +12,7 @@ import { ensurePlatformUser } from './domain/platform';
 import { resolveEvmAddresses } from './domain/runtime';
 import { adminRoutes } from './routes/admin';
 import { publicRoutes } from './routes/public';
+import { rpcRoutes } from './routes/rpc';
 import { startWorkers, type RunnerHandle } from './workers/runner';
 
 const log = createLogger('api');
@@ -26,6 +27,7 @@ export function createApp(): express.Express {
   app.use(express.json({ limit: '256kb' }));
   app.use(rateLimit({ windowMs: 60_000, max: 600, standardHeaders: true, legacyHeaders: false }));
   app.use('/api', publicRoutes);
+  app.use('/api', rpcRoutes);
   app.use('/api/admin', adminRoutes);
   app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
     if (isDomainError(err)) {

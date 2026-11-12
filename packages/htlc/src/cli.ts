@@ -156,8 +156,17 @@ async function cmdClaimOrRefund(kind: 'claim' | 'refund', args: Args): Promise<v
     signed = buildRefundTx({ htlc, outpoint, destination: to, signer, feeRateSatVb: feeRate });
   }
   const rpc = rpcFrom(args);
-  if (args.flags.broadcast && rpc) {
-    const txid = await rpc.call<string>('sendrawtransaction', [signed.hex]);
+  if (args.flags.broadcast) {
+    let txid: string;
+    if (rpc) {
+      txid = await rpc.call<string>('sendrawtransaction', [signed.hex]);
+    } else {
+      const api = (flag(args, 'api', 'BTQ_SWAP_API') ?? 'http://127.0.0.1:5173/api').replace(/\/+$/, '');
+      const r = await fetch(`${api}/public/btq/tx`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ hex: signed.hex }) });
+      const j = (await r.json()) as { txid?: string; error?: string };
+      if (!r.ok || !j.txid) throw new Error(`broadcast failed: ${j.error ?? r.status}`);
+      txid = j.txid;
+    }
     out({ broadcast: true, txid, feeSats: signed.feeSats, outputSats: signed.outputSats });
     return;
   }
@@ -224,7 +233,7 @@ const HELP = `btq-htlc ${CLI_VERSION} — non-custodial BTQ Swap signer
   btq-htlc link <challenge>              sign the /swap link-btq challenge
   btq-htlc secret new --swap <n>         create the swap secret (buyer); prints its SHA-256
   btq-htlc secret show --swap <n>
-  btq-htlc claim  --swap <n> --to <btq address> [--api URL] [--broadcast --rpc URL --rpcuser U --rpcpass P]
+  btq-htlc claim  --swap <n> --to <btq address> [--api URL] [--broadcast [--rpc URL --rpcuser U --rpcpass P]]
   btq-htlc refund --swap <n> --to <btq address> [...]
   btq-htlc evm lock|claim|refund --swap <n> --evm-rpc URL --key env:VAR   (wallets without MetaMask)
 

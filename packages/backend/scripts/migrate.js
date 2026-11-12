@@ -7,6 +7,8 @@ async function migrate(connectionString, { log = console.log } = {}) {
   const pool = new Pool({ connectionString });
   const client = await pool.connect();
   try {
+    // Serialize concurrent migrators (api + bootstrap containers start together).
+    await client.query('SELECT pg_advisory_lock(727001)');
     await client.query(`CREATE TABLE IF NOT EXISTS schema_migrations (
       name TEXT PRIMARY KEY,
       applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -42,6 +44,7 @@ async function migrate(connectionString, { log = console.log } = {}) {
     if (count === 0) log('[migrate] up to date');
     return count;
   } finally {
+    await client.query('SELECT pg_advisory_unlock(727001)').catch(() => undefined);
     client.release();
     await pool.end();
   }

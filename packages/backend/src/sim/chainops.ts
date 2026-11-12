@@ -31,6 +31,15 @@ export interface Descriptor {
 export class ChainOps {
   readonly provider: JsonRpcProvider;
   private signers = new Map<string, NonceManager>();
+  private queues = new Map<string, Promise<unknown>>();
+
+  /** One wallet = one sequence of transactions (approve+lock must not interleave across swaps). */
+  private serial<T>(p: Persona, fn: () => Promise<T>): Promise<T> {
+    const prev = this.queues.get(p.name) ?? Promise.resolve();
+    const next = prev.then(fn, fn);
+    this.queues.set(p.name, next.catch(() => undefined));
+    return next;
+  }
 
   constructor(private readonly apiUrl: string, evmRpcUrl: string, chainId: number) {
     this.provider = new JsonRpcProvider(evmRpcUrl, chainId, { staticNetwork: true, cacheTimeout: -1 });
@@ -73,6 +82,10 @@ export class ChainOps {
 
   /** Buyer: approve + createHTLCProposal with the swap binding (like `btq-htlc evm lock`). */
   async evmLock(p: Persona, d: Descriptor, overrides: { amountUnits?: bigint; deadline?: number } = {}): Promise<string> {
+    return this.serial(p, () => this.evmLockNow(p, d, overrides));
+  }
+
+  private async evmLockNow(p: Persona, d: Descriptor, overrides: { amountUnits?: bigint; deadline?: number }): Promise<string> {
     const secretHash = this.newSecret(p, d.swap.shortId);
     const latest = await this.provider.getBlock('latest');
     const deadline = overrides.deadline ?? latest!.timestamp + d.evm.lockDurationSec;
@@ -89,14 +102,14 @@ export class ChainOps {
   async evmClaim(p: Persona, d: Descriptor): Promise<string> {
     if (!d.preimage || !d.evm.agreementId) throw new Error('nothing to claim yet');
     const htlc = new Contract(d.evm.htlcContract, HTLC_ERC20_ABI, this.signer(p));
-    return this.send(p, () => htlc.getFunction('withdrawTokens')(d.evm.agreementId, `0x${d.preimage}`));
+    return this.serial(p, () => this.send(p, () => htlc.getFunction('withdrawTokens')(d.evm.agreementId, `0x${d.preimage}`)));
   }
 
   /** Buyer: refund USDT after the deadline (like `btq-htlc evm refund`). */
   async evmRefund(p: Persona, d: Descriptor): Promise<string> {
     if (!d.evm.agreementId) throw new Error('no EVM lock');
     const htlc = new Contract(d.evm.htlcContract, HTLC_ERC20_ABI, this.signer(p));
-    return this.send(p, () => htlc.getFunction('refundTokens')(d.evm.agreementId));
+    return this.serial(p, () => this.send(p, () => htlc.getFunction('refundTokens')(d.evm.agreementId)));
   }
 
   /** Seller: send BTQ to the HTLC address from the persona's own node wallet (like `btq-cli sendtoaddress`). */

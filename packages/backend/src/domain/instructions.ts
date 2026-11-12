@@ -104,7 +104,7 @@ export function instructionFor(swap: SwapRow, role: Role, tipHeight?: number): I
             `The seller's BTQ is locked for your swap key. Claim it before block **${swap.btq_refund_locktime}**` +
             (tipHeight ? ` (now ${tipHeight})` : '') +
             `. Claiming reveals your secret, which lets the seller collect the USDT.`,
-          commands: [cli(`claim --swap ${n} --to ${swap.buyer_btq_address ?? '<your BTQ address>'}`), `btq-cli ${btqCliNetworkFlag(swap.btq_network as never)}sendrawtransaction <hex printed above>`],
+          commands: [cli(`claim --swap ${n} --to ${swap.buyer_btq_address ?? '<your BTQ address>'} --broadcast`)],
           deadline: null,
         };
       }
@@ -142,7 +142,7 @@ export function instructionFor(swap: SwapRow, role: Role, tipHeight?: number): I
           actionable: true,
           headline: `Refund your ${btq}`,
           detail: `The buyer never claimed. Your BTQ refund opened at block ${swap.btq_refund_locktime}.`,
-          commands: [cli(`refund --swap ${n} --to ${swap.seller_btq_address ?? '<your BTQ address>'}`), `btq-cli ${btqCliNetworkFlag(swap.btq_network as never)}sendrawtransaction <hex printed above>`],
+          commands: [cli(`refund --swap ${n} --to ${swap.seller_btq_address ?? '<your BTQ address>'} --broadcast`)],
           deadline: null,
         };
       }

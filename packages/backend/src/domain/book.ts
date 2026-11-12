@@ -49,7 +49,7 @@ function normalizePrice(v: string): string {
   }
 }
 
-async function matchTaker(c: Queryable, taker: OrderRow, takerUser: UserRow): Promise<SwapRow[]> {
+async function matchTaker(c: Queryable, taker: OrderRow, takerUser: UserRow, onlyMakerId?: string): Promise<SwapRow[]> {
   await c.query('SELECT pg_advisory_xact_lock($1)', [MATCH_LOCK_KEY]);
   const fresh = await one<OrderRow>(c, 'SELECT * FROM orders WHERE id = $1 FOR UPDATE', [taker.id]);
   if (!fresh || !['open', 'partially_filled'].includes(fresh.status)) return [];
@@ -62,11 +62,12 @@ async function matchTaker(c: Queryable, taker: OrderRow, takerUser: UserRow): Pr
     `SELECT * FROM orders
       WHERE side = $1 AND status IN ('open', 'partially_filled') AND user_id <> $2
         AND (CASE WHEN $1 = 'sell' THEN price_usdt <= $3 ELSE price_usdt >= $3 END)
+        AND ($4::uuid IS NULL OR id = $4::uuid)
       ORDER BY CASE WHEN $1 = 'sell' THEN price_usdt END ASC,
                CASE WHEN $1 = 'buy' THEN price_usdt END DESC,
                created_at ASC
       FOR UPDATE SKIP LOCKED`,
-    [opposite, fresh.user_id, fresh.price_usdt],
+    [opposite, fresh.user_id, fresh.price_usdt, onlyMakerId ?? null],
   );
 
   const { htlc, token } = evmChain().addresses();
@@ -169,6 +170,33 @@ export async function placeOrder(userId: string, input: PlaceOrderInput): Promis
   });
 }
 
+/** Take one specific resting order (IOC at that order's price, matched only against it). */
+export async function takeOrder(userId: string, orderRef: string, amountBtq: string): Promise<PlaceOrderResult> {
+  const user = await getUserById(userId);
+  if (!user) throw new DomainError('NOT_REGISTERED', 'Run `/swap start` first.');
+  assertCanTrade(user);
+  const settings = await getSettings();
+  if (settings.book_paused) throw new DomainError('BOOK_PAUSED', 'The order book is paused by the operator. Try again later.');
+  const maker = await getOrder(orderRef);
+  if (!maker || !['open', 'partially_filled'].includes(maker.status)) throw new DomainError('NOT_FOUND', `Order #${orderRef} is not on the book.`);
+  if (maker.user_id === user.id) throw new DomainError('VALIDATION', 'You cannot take your own order.');
+  const sats = normalizeAmount(amountBtq);
+  const remaining = toUnits(maker.amount_btq, 8) - toUnits(maker.filled_btq, 8);
+  if (sats > remaining) throw new DomainError('VALIDATION', `Only ${fromUnits(remaining, 8)} BTQ is left on order #${maker.short_id}.`);
+  if (sats < toUnits(settings.min_order_btq, 8) && sats !== remaining) throw new DomainError('VALIDATION', `Minimum take is ${settings.min_order_btq} BTQ.`);
+  const side: Side = maker.side === 'sell' ? 'buy' : 'sell';
+  return tx(async (c) => {
+    const order = await one<OrderRow>(
+      c,
+      `INSERT INTO orders (user_id, side, price_usdt, amount_btq, is_mm, tif) VALUES ($1, $2, $3, $4, false, 'ioc') RETURNING *`,
+      [user.id, side, maker.price_usdt, fromUnits(sats, 8)],
+    );
+    const swaps = await matchTaker(c, order!, user, maker.id);
+    const final = await one<OrderRow>(c, 'SELECT * FROM orders WHERE id = $1', [order!.id]);
+    return { order: final!, swaps, remainderCancelled: final!.status === 'cancelled' };
+  });
+}
+
 export async function getOrder(ref: string, q: Queryable = db()): Promise<OrderRow | null> {
   const s = ref.trim().replace(/^#/, '');
   if (/^\d+$/.test(s)) return one<OrderRow>(q, 'SELECT * FROM orders WHERE short_id = $1', [s]);
@@ -206,9 +234,19 @@ export interface BookLevel {
   mm: boolean;
 }
 
+export interface PublicOrder {
+  orderNo: number;
+  side: Side;
+  price: string;
+  remainingBtq: string;
+  mm: boolean;
+}
+
 export interface PublicBook {
   bids: BookLevel[];
   asks: BookLevel[];
+  topBids: PublicOrder[];
+  topAsks: PublicOrder[];
   bestBid: string | null;
   bestAsk: string | null;
   paused: boolean;
@@ -226,7 +264,25 @@ export async function publicBook(depth = 10): Promise<PublicBook> {
   const bids = rows.filter((r) => r.side === 'buy').sort((a, b) => Number(b.price) - Number(a.price)).slice(0, depth).map(lvl);
   const asks = rows.filter((r) => r.side === 'sell').sort((a, b) => Number(a.price) - Number(b.price)).slice(0, depth).map(lvl);
   const settings = await getSettings();
-  return { bids, asks, bestBid: bids[0]?.price ?? null, bestAsk: asks[0]?.price ?? null, paused: settings.book_paused };
+  const top = await many<{ short_id: string; side: Side; price_usdt: string; remaining: string; is_mm: boolean }>(
+    db(),
+    `(SELECT short_id, side, price_usdt::text, (amount_btq - filled_btq)::text AS remaining, is_mm FROM orders
+       WHERE status IN ('open','partially_filled') AND tif = 'gtc' AND side = 'sell' ORDER BY price_usdt ASC, created_at ASC LIMIT $1)
+     UNION ALL
+     (SELECT short_id, side, price_usdt::text, (amount_btq - filled_btq)::text AS remaining, is_mm FROM orders
+       WHERE status IN ('open','partially_filled') AND tif = 'gtc' AND side = 'buy' ORDER BY price_usdt DESC, created_at ASC LIMIT $1)`,
+    [depth],
+  );
+  const po = (r: (typeof top)[number]): PublicOrder => ({ orderNo: Number(r.short_id), side: r.side, price: r.price_usdt, remainingBtq: r.remaining, mm: r.is_mm });
+  return {
+    bids,
+    asks,
+    topBids: top.filter((r) => r.side === 'buy').map(po),
+    topAsks: top.filter((r) => r.side === 'sell').map(po),
+    bestBid: bids[0]?.price ?? null,
+    bestAsk: asks[0]?.price ?? null,
+    paused: settings.book_paused,
+  };
 }
 
 // ── operator (MM desk) ──

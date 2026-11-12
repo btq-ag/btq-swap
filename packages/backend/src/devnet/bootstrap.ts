@@ -5,7 +5,9 @@
 import path from 'node:path';
 import { config } from '../config';
 import { btqChain } from '../chains/btq';
-import { evmChain } from '../chains/evm';
+import { EvmChain, evmChain } from '../chains/evm';
+
+export const DEFAULT_FAUCET_KEY = '0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6'; // anvil dev account #9
 import { db, one, closePool } from '../lib/db';
 import { createLogger } from '../lib/logger';
 import { mmOrders, postMmOrder } from '../domain/book';
@@ -51,6 +53,15 @@ export async function bootstrap(): Promise<void> {
   }
   log.info('platform BTQ balance', { btq: Number(await btq.platformBalanceSats(1)) / 1e8, height: (await btq.tip()).height });
 
+  // ── EVM: gas for the platform and faucet keys (devnet chain only: anvil_setBalance) ──
+  const faucetAddress = new EvmChain({ url: c.EVM_RPC_URL, chainId: c.EVM_CHAIN_ID, privateKey: process.env.DEVNET_FAUCET_EVM_KEY ?? DEFAULT_FAUCET_KEY }).platformAddress;
+  for (const addr of [evm.platformAddress, faucetAddress]) {
+    if ((await evm.ethBalance(addr)) < 100n * 10n ** 18n) {
+      await evm.provider.send('anvil_setBalance', [addr, '0x' + (10_000n * 10n ** 18n).toString(16)]);
+      log.info('set devnet ETH balance', { addr });
+    }
+  }
+
   // ── EVM: contracts (redeploy if anvil lost its state) ──
   const prev = await one<{ value: { htlc: string; token: string } }>(db(), `SELECT value FROM devnet_state WHERE key = 'evm_contracts'`);
   let addrs = prev?.value ?? null;
@@ -65,6 +76,24 @@ export async function bootstrap(): Promise<void> {
   }
   evm.setAddresses(addrs);
   log.info('EVM contracts', addrs);
+
+  // ── devnet faucet (separate keys so simulations never race the platform agent's nonces/coins) ──
+  const faucetKey = process.env.DEVNET_FAUCET_EVM_KEY ?? DEFAULT_FAUCET_KEY;
+  const faucet = new EvmChain({ url: c.EVM_RPC_URL, chainId: c.EVM_CHAIN_ID, privateKey: faucetKey });
+  faucet.setAddresses(addrs);
+  const faucetUsdt = await evm.tokenBalance(faucet.platformAddress);
+  if (faucetUsdt < 1_000_000n * 10n ** BigInt(c.USDT_DECIMALS)) {
+    await evm.platformTransferToken(faucet.platformAddress, 10_000_000n * 10n ** BigInt(c.USDT_DECIMALS));
+    log.info('funded devnet faucet with USDT', { faucet: faucet.platformAddress });
+  }
+  const fw = await btq.ensureWallet('faucet');
+  for (let round = 0; round < 8; round++) {
+    const b = await fw.call<{ mine: { trusted: number } }>('getbalances');
+    if (b.mine.trusted >= Number(process.env.DEVNET_FAUCET_MIN_BTQ ?? '2000')) break;
+    const a = await fw.call<string>('getnewaddress', ['coinbase']);
+    log.info('mining 150 regtest blocks to the faucet wallet');
+    await fw.call('generatetoaddress', [150, a]);
+  }
 
   // ── platform identity + admins ──
   await ensurePlatformUser();
