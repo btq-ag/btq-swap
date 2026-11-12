@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: htlc — typecheck, build, unit tests
+        run: |
+          npm run build -w packages/htlc
+          node packages/htlc/scripts/bundle.mjs
+          npm test -w packages/htlc
+      - name: backend — typecheck + unit tests
+        run: |
+          npm run typecheck -w packages/backend
+          npm test -w packages/backend
+      - name: frontend — typecheck + build
+        run: npm run build -w packages/frontend
+      - name: contracts — HtlcERC20 tests
+        run: npm test -w packages/contracts
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -f packages/backend/Dockerfile -t btq-swap-backend:ci .
+      - run: docker build -f packages/frontend/Dockerfile -t btq-swap-web:ci .
