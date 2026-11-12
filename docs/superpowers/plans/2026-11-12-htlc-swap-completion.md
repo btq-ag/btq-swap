@@ -271,13 +271,30 @@ Each task: write failing test → implement → run → commit. Commands assume 
 #### Task G3: Ops skill
 - [ ] `~/.cursor/skills/btq-swap-vultr-ops/SKILL.md` + `.env` (host, credentials, layout, health checks, sim commands). Never committed.
 
-### Phase H — Acceptance
+### Phase H — Acceptance (status 2026-11-12)
 
-- [ ] `npm test` (htlc, backend), `npx hardhat test` (contracts) all green.
-- [ ] `npm run sim -- --scenario all` on the VPS: every scenario passes; report committed under `docs/evidence/`.
-- [ ] Dashboard at `http://208.85.23.103:5173` shows the run live; screenshots captured.
-- [ ] `#btq-swap` shows the live feed for the run; a human-driven Discord swap (real slash commands from the Discord client) completes end to end.
-- [ ] Gap list items 1–10 each mapped to the commit that closes them (table in the final report).
+- [x] Unit suites green: htlc 25 (+7 live regtest/anvil tests run with `BTQ_LIVE=1`/`EVM_LIVE=1`), backend 35, contracts 15.
+- [x] Simulation `vps1` on the VPS: 9/9 scenarios, 41/41 checks, 15 swaps (12 completed, 2 refunded, 1 expired), 287 bot interactions — `docs/evidence/sim-vps1.md`.
+- [x] Real-user path with only the published `btq-htlc` CLI + public API/RPC: swaps #17 (buy) and #18 (sell) completed — `docs/evidence/cli-e2e-vps.log`.
+- [x] Independent chain check of swap #4 (btqd witness + EVM receipt) — `docs/evidence/swap4-independent-chain-check.txt`.
+- [x] Monitor live at `http://208.85.23.103:5173` — screenshots in `docs/evidence/`.
+- [x] `#btq-swap` carries the live per-swap cards, the run summary and the transcript thread.
+- [ ] Human-driven swap from the Discord client (a person typing `/swap` in `#btq-swap`). Bots cannot invoke slash commands, so this needs a human tester; the commands are registered and every payload passes discord.js's validators.
+
+| Gap (analysis §Blockers) | Closed by | Evidence |
+|---|---|---|
+| 1 users cannot sign BTQ HTLC spends | `071b60e` (`@btq-swap/htlc` + CLI) | live claim/refund tests; swap #17 claim via CLI |
+| 2 EVM ABI mismatch | `b98c082` (real `HtlcERC20` ABI, artifact-verified) | `evm.live.test.ts`; every EVM tx in sim-vps1 |
+| 3 USDT locked to nobody (`partyB`) | `b98c082` (`validateLockup` requires partyB = seller) | unit test "wrong recipient"; seller withdrawals in sim |
+| 4 platform knew user secrets | `b98c082` (buyer-held preimage; platform secret only when it is buyer, AES-GCM) | instructions test; sell-to-mm (#6) |
+| 5 no counterparty binding | `b98c082` (intents + post-match locks + `otherAsset` swap binding) | p2p (#7), partial-fill (#8/#9) |
+| 6 `agreementId` never tracked | `b98c082` (`computeAgreementId`, stored + checked) | unit test "forged agreement id" |
+| 7 matched swaps never progress | `b98c082` (state machine + platform agent) | 12 completed swaps in sim-vps1 |
+| 8 fake claim detection | `b98c082` (block + mempool scan, preimage verified against the leaf) | swap #4 witness check |
+| 9 no Discord product | `4810725`, `51406f3` | registered commands, payload tests, channel feed |
+| 10 contract tests did not run | `071b60e` (hardhat config) | 15 passing |
+| — HTLC preimage-length attack | `071b60e` (`OP_SIZE 32 OP_EQUALVERIFY`) | `script.test.ts` |
+| — nginx 502 after API redeploy (found in this run) | `f198edc` | recreate-api regression check |
 
 ## 6. Out of scope (unchanged from master spec)
 
