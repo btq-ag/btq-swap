@@ -1,6 +1,6 @@
 # BTQ Swap devnet stack (VPS): BTQ regtest + anvil + Postgres + API/workers + Discord bot + monitor.
 #   docker compose -f deploy/docker-compose.yml --env-file deploy/.env up -d
-name: btq-swap
+name: btqswap
 
 x-backend: &backend
   image: btq-swap-backend:${IMAGE_TAG:-latest}

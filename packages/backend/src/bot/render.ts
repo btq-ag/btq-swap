@@ -10,7 +10,7 @@ export const COLOR = { brand: 0x3b82f6, ok: 0x10b981, warn: 0xf59e0b, bad: 0xef4
 const ICON = { done: '🟢', active: '🔵', pending: '⚪', skipped: '⚫', failed: '🔴' } as const;
 
 export function button(label: string, customId: string, style: ButtonPayload['style'] = 1): ButtonPayload {
-  return { type: 2, style, label, custom_id: customId };
+  return { type: 2, style, label: label.slice(0, 80), custom_id: customId };
 }
 
 export function row(...b: ButtonPayload[]): RowPayload {
@@ -18,7 +18,8 @@ export function row(...b: ButtonPayload[]): RowPayload {
 }
 
 export function textInput(customId: string, label: string, opts: Partial<TextInputPayload> = {}): { type: 1; components: [TextInputPayload] } {
-  return { type: 1, components: [{ type: 4, custom_id: customId, label, style: 1, required: true, ...opts }] };
+  // Discord limits: label ≤ 45, custom_id ≤ 100 (enforced again by tests through discord.js validators)
+  return { type: 1, components: [{ type: 4, custom_id: customId, label: label.slice(0, 45), style: 1, required: true, ...opts }] };
 }
 
 export function modal(customId: string, title: string, inputs: Array<{ type: 1; components: [TextInputPayload] }>): ModalPayload {

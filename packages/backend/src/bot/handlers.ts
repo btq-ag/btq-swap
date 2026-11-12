@@ -186,7 +186,7 @@ export async function orderForm(_i: BotInteraction, ctx: Ctx, r: Responder, side
   await r.modal(
     modal(id('order', ctx, side), side === 'buy' ? 'Buy BTQ with USDT' : 'Sell BTQ for USDT', [
       textInput('amount', 'Amount of BTQ', { placeholder: '1.5', max_length: 20 }),
-      textInput('price', `Limit price in USDT, or "market" (best ${hint ?? '—'})`, { value: 'market', max_length: 20 }),
+      textInput('price', `Price in USDT or "market" (best ${hint ? Number(hint).toString() : '—'})`, { value: 'market', max_length: 20 }),
     ]),
   );
 }
