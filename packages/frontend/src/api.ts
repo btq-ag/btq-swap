@@ -28,6 +28,7 @@ export interface SwapView {
   steps: Step[];
   secretHash: string | null;
   preimage: string | null;
+  rail?: 'evm' | 'solana';
   evm: { chainId: number; contract: string; agreementId: string | null; lockTx: string | null; lockConfs: number; deadline: string | null; claimTx: string | null; refundTx: string | null };
   btq: { network: string; htlcAddress: string | null; refundLocktime: number | null; lockTxid: string | null; lockVout: number | null; lockConfs: number; claimTxid: string | null; refundTxid: string | null };
   deadlines: { buyerLockBy: string; sellerLockBy: string | null };
@@ -43,7 +44,9 @@ export interface MonitorState {
   chains: {
     btq: { network: string; tip: number; tipHash: string; mempool: number; lastTickAt: number; targetBlockSec: number; minConfirmations: number };
     evm: { chainId: number; head: number; lastTickAt: number; minConfirmations: number };
+    solana?: { slot: number; lastTickAt: number; reachable: boolean };
   };
+  settlementRail?: 'evm' | 'solana';
   timing: { buyerLockWindowSec: number; evmLockDurationSec: number; sellerLockWindowSec: number; btqLockBlocks: number; safetyMarginSec: number; sellerBudgetSec: number };
   stats: { active: number; completed: number; refunded: number; expired: number; failed: number; volumeBtq: string; volumeUsdt: string; avgCompletionSec: number };
   book: {

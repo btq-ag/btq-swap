@@ -47,6 +47,13 @@ const envSchema = z.object({
   HTLC_CONTRACT_ADDRESS: optionalAddress,
   USDT_TOKEN_ADDRESS: optionalAddress,
   USDT_DECIMALS: z.coerce.number().int().min(0).max(18).default(6),
+  /** One URL, or a comma-separated list. Public devnet RPCs are added until there are 10. */
+  SOLANA_RPC_URL: z.string().optional(),
+  PUBLIC_SOLANA_RPC_URL: z.string().url().optional(),
+  SOLANA_HTLC_PROGRAM_ID: z.string().optional(),
+  SOLANA_TOKEN_MINT: z.string().optional(),
+  /** Base58 secret key of the platform Solana wallet. Required for the platform to lock, claim, or refund on Solana. */
+  SOLANA_PLATFORM_SECRET: z.string().optional(),
   EVM_MIN_CONFIRMATIONS: z.coerce.number().int().min(1).default(12),
   EVM_LOG_RANGE: z.coerce.number().int().positive().default(2000),
 

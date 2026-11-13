@@ -10,6 +10,7 @@ import { setBanned } from '../domain/identity';
 import { loadInventory, refreshInventory } from '../domain/inventory';
 import { fromUnits } from '../domain/money';
 import { swapView } from '../domain/monitor';
+import { solanaReady } from '../chains/solana';
 import { getSettings, setSetting, SETTINGS_SCHEMA, type SettingKey } from '../domain/settings';
 import { getSwap, swapEvents } from '../domain/settlement';
 import type { SwapRow } from '../domain/types';
@@ -126,6 +127,13 @@ adminRoutes.post('/settings', wrap(async (req, res) => {
   if (!(key in SETTINGS_SCHEMA)) {
     res.status(400).json({ error: 'unknown setting' });
     return;
+  }
+  if (key === 'settlement_rail' && req.body?.value === 'solana') {
+    const problem = await solanaReady();
+    if (problem) {
+      res.status(400).json({ error: problem });
+      return;
+    }
   }
   res.json({ key, value: await setSetting(key, req.body?.value, 'admin:web') });
 }));

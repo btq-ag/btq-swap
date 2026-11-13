@@ -78,7 +78,7 @@ async function matchTaker(c: Queryable, taker: OrderRow, takerUser: UserRow, onl
     const makerUser = await getUserById(maker.user_id, c);
     if (!makerUser || makerUser.is_banned) continue;
     try {
-      assertCanTrade(makerUser);
+      assertCanTrade(makerUser, (await getSettings(c)).settlement_rail);
     } catch {
       continue;
     }
@@ -126,8 +126,8 @@ async function matchTaker(c: Queryable, taker: OrderRow, takerUser: UserRow, onl
 export async function placeOrder(userId: string, input: PlaceOrderInput): Promise<PlaceOrderResult> {
   const user = await getUserById(userId);
   if (!user) throw new DomainError('NOT_REGISTERED', 'Run `/swap start` first.');
-  assertCanTrade(user);
   const settings = await getSettings();
+  assertCanTrade(user, settings.settlement_rail);
   if (settings.book_paused) throw new DomainError('BOOK_PAUSED', 'The order book is paused by the operator. Try again later.');
   if (input.isMm && !user.is_platform) throw new DomainError('FORBIDDEN', 'Only the platform posts market-maker orders.');
   if (user.is_platform && !input.isMm) throw new DomainError('FORBIDDEN', 'Platform orders must be market-maker orders.');
@@ -174,8 +174,8 @@ export async function placeOrder(userId: string, input: PlaceOrderInput): Promis
 export async function takeOrder(userId: string, orderRef: string, amountBtq: string): Promise<PlaceOrderResult> {
   const user = await getUserById(userId);
   if (!user) throw new DomainError('NOT_REGISTERED', 'Run `/swap start` first.');
-  assertCanTrade(user);
   const settings = await getSettings();
+  assertCanTrade(user, settings.settlement_rail);
   if (settings.book_paused) throw new DomainError('BOOK_PAUSED', 'The order book is paused by the operator. Try again later.');
   const maker = await getOrder(orderRef);
   if (!maker || !['open', 'partially_filled'].includes(maker.status)) throw new DomainError('NOT_FOUND', `Order #${orderRef} is not on the book.`);

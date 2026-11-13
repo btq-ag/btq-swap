@@ -4,56 +4,64 @@
 
 @layer base {
   html {
-    background: #0e1525;
-    color: #e6eaf2;
+    background: #0f1116;
+    color: #f5f6f8;
     color-scheme: dark;
     -webkit-font-smoothing: antialiased;
   }
   body {
-    font-family: 'Instrument Sans', ui-sans-serif, system-ui, sans-serif;
-    font-size: 15px;
-    line-height: 1.5;
+    font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+    font-size: 13px;
+    line-height: 1.45;
   }
   * {
     scrollbar-width: thin;
-    scrollbar-color: #2e3b5a transparent;
+    scrollbar-color: #2a2f3a transparent;
   }
   :focus-visible {
-    outline: 2px solid #f5c451;
+    outline: 2px solid #0052ff;
     outline-offset: 2px;
-    border-radius: 4px;
   }
+  input, button { font: inherit; }
 }
 
 @layer components {
+  .num { font-variant-numeric: tabular-nums; font-feature-settings: 'tnum' 1; }
   .hash {
     font-family: 'JetBrains Mono', ui-monospace, monospace;
     font-size: 12px;
-    letter-spacing: -0.01em;
   }
   .panel {
-    background: #151e33;
-    border: 1px solid #24304b;
-    border-radius: 14px;
+    background: #161920;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 8px;
   }
+  .hairline { border-color: rgba(255, 255, 255, 0.08); }
 }
 
-/* The secret crossing from the BTQ lane to the EVM lane: the one animated moment. */
+@keyframes tick-up {
+  from { background-color: rgba(0, 200, 130, 0.35); }
+  to { background-color: transparent; }
+}
+@keyframes tick-down {
+  from { background-color: rgba(244, 70, 86, 0.35); }
+  to { background-color: transparent; }
+}
+.tick-up { animation: tick-up 450ms ease-out; }
+.tick-down { animation: tick-down 450ms ease-out; }
+
 @keyframes key-cross {
   0% { transform: translateY(0); opacity: 0; }
   20% { opacity: 1; }
   100% { transform: translateY(-26px); opacity: 1; }
 }
-.key-cross {
-  animation: key-cross 900ms ease-out both;
-}
+.key-cross { animation: key-cross 900ms ease-out both; }
 @keyframes pulse-dot {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(56, 189, 248, 0.5); }
-  50% { box-shadow: 0 0 0 6px rgba(56, 189, 248, 0); }
+  0%, 100% { box-shadow: 0 0 0 0 rgba(0, 200, 130, 0.45); }
+  50% { box-shadow: 0 0 0 6px rgba(0, 200, 130, 0); }
 }
-.pulse-dot {
-  animation: pulse-dot 1.8s ease-in-out infinite;
-}
+.pulse-dot { animation: pulse-dot 1.8s ease-in-out infinite; }
+
 @media (prefers-reduced-motion: reduce) {
-  .key-cross, .pulse-dot { animation: none; }
+  .key-cross, .pulse-dot, .tick-up, .tick-down { animation: none; }
 }

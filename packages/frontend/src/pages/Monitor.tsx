@@ -1,8 +1,16 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { getJson, type MonitorState, type SwapView } from '../api';
 import { BookPanel, EventStream, InventoryPanel, NotificationPanel } from '../components/Side';
 import { SwapCard } from '../components/SwapCard';
 import { ago, trimAmount, useNow, usePoll } from '../hooks';
+
+interface SwapSearch {
+  swaps: SwapView[];
+  total: number;
+  page: number;
+  pageSize: number;
+  pages: number;
+}
 
 type Filter = 'active' | 'completed' | 'refunds' | 'all';
 const FILTERS: Array<{ id: Filter; label: string; match: (s: SwapView) => boolean }> = [
@@ -22,14 +30,28 @@ function ChainPill({ name, color, detail, fresh }: { name: string; color: string
   );
 }
 
+function Pager({ page, pages, onPage }: { page: number; pages: number; onPage: (n: number) => void }) {
+  return (
+    <div className="flex items-center justify-between text-sm text-fog-3">
+      <button type="button" disabled={page <= 1} onClick={() => onPage(page - 1)} className="rounded-md border border-ink-line px-3 py-1 disabled:opacity-40">Previous</button>
+      <span className="tabular-nums">{page} / {pages}</span>
+      <button type="button" disabled={page >= pages} onClick={() => onPage(page + 1)} className="rounded-md border border-ink-line px-3 py-1 disabled:opacity-40">Next</button>
+    </div>
+  );
+}
+
 export function MonitorPage() {
   const { data, error, at } = usePoll(() => getJson<MonitorState>('/public/monitor'), 2000);
   const now = useNow(1000);
   const [filter, setFilter] = useState<Filter>('active');
-  const swaps = useMemo(() => {
-    const f = FILTERS.find((x) => x.id === filter)!;
-    return (data?.swaps ?? []).filter(f.match).sort((a, b) => b.shortId - a.shortId);
-  }, [data, filter]);
+  const [query, setQuery] = useState('');
+  const [page, setPage] = useState(1);
+  const list = usePoll(
+    () => getJson<SwapSearch>(`/public/swaps?filter=${filter}&page=${page}&limit=8&q=${encodeURIComponent(query.trim())}`),
+    2000,
+    [filter, page, query],
+  );
+  useEffect(() => { setPage(1); }, [filter, query]);
 
   if (!data) {
     return (
@@ -39,21 +61,30 @@ export function MonitorPage() {
     );
   }
   const { chains, stats } = data;
+  const solana = data.settlementRail === 'solana';
   const btqFresh = now - chains.btq.lastTickAt < 15_000;
   const evmFresh = now - chains.evm.lastTickAt < 15_000;
+  const solFresh = !!chains.solana?.reachable && now - (chains.solana?.lastTickAt ?? 0) < 15_000;
+  const swaps = list.data?.swaps ?? [];
+  const pages = list.data?.pages ?? 1;
+  const shownPage = list.data?.page ?? page;
 
   return (
     <main className="mx-auto max-w-7xl px-5 pb-16 pt-6">
       <header className="flex flex-wrap items-end justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight text-fog">BTQ ⇄ USDT settlement monitor</h1>
+          <h1 className="text-2xl font-semibold tracking-tight text-fog">Settlement</h1>
           <p className="mt-1 max-w-2xl text-sm text-fog-3">
-            Every swap below is two hash time-locked contracts: USDT locked on the EVM chain, BTQ locked in a Dilithium P2MR script. The buyer's secret, revealed when they claim BTQ, is what lets the seller claim USDT.
+            {solana ? 'USDT on Solana, BTQ in a Dilithium HTLC.' : 'USDT on the EVM chain, BTQ in a Dilithium HTLC.'} The buyer’s secret is what lets the seller collect.
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
           <ChainPill name={`BTQ ${chains.btq.network}`} color="text-btq" detail={`height ${chains.btq.tip} · mempool ${chains.btq.mempool}`} fresh={btqFresh} />
-          <ChainPill name={`EVM ${chains.evm.chainId}`} color="text-evm" detail={`block ${chains.evm.head}`} fresh={evmFresh} />
+          {solana ? (
+            <ChainPill name="Solana" color="text-evm" detail={`slot ${chains.solana?.slot ?? '—'}`} fresh={solFresh} />
+          ) : (
+            <ChainPill name={`EVM ${chains.evm.chainId}`} color="text-evm" detail={`block ${chains.evm.head}`} fresh={evmFresh} />
+          )}
         </div>
       </header>
 
@@ -86,19 +117,35 @@ export function MonitorPage() {
                   onClick={() => setFilter(f.id)}
                   className={`rounded-md px-3 py-1 text-sm ${filter === f.id ? 'bg-ink-3 text-fog' : 'text-fog-3 hover:text-fog-2'}`}
                 >
-                  {f.label} <span className="tabular-nums text-fog-4">{data.swaps.filter(f.match).length}</span>
+                  {f.label}
                 </button>
               ))}
             </div>
           </div>
+          <form className="mt-3" onSubmit={(e) => e.preventDefault()}>
+            <label className="block text-sm text-fog-3">
+              Find a transaction
+              <input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Swap number, Solana signature, BTQ txid, or agreement id"
+                className="mt-1 w-full rounded-lg border border-ink-line bg-ink px-3 py-2 text-fog"
+              />
+            </label>
+          </form>
           <div className="mt-3 space-y-3">
+            {list.error && <p className="text-sm text-bad">{list.error}</p>}
             {swaps.length === 0 && (
               <div className="panel p-6 text-sm text-fog-3">
-                {filter === 'active' ? 'No swap is in flight. Start one in Discord with /swap buy or /swap sell, or run the simulation suite.' : 'Nothing here yet.'}
+                {query.trim() ? 'No transaction matches that.' : filter === 'active' ? 'No swap is in flight.' : 'Nothing here yet.'}
               </div>
             )}
-            {swaps.slice(0, 40).map((s) => <SwapCard key={s.id} swap={s} chains={chains} now={now} />)}
+            {swaps.map((s) => <SwapCard key={s.id} swap={s} chains={chains} now={now} />)}
           </div>
+          <div className="mt-3">
+            <Pager page={shownPage} pages={pages} onPage={setPage} />
+          </div>
+          {list.data && <p className="mt-2 text-xs text-fog-4">{list.data.total} matching swaps</p>}
         </section>
         <aside className="space-y-6">
           <BookPanel book={data.book} />
@@ -109,7 +156,7 @@ export function MonitorPage() {
       </div>
       <footer className="mt-10 flex flex-wrap justify-between gap-2 text-xs text-fog-4">
         <span>
-          Timelocks: buyer window {data.timing.buyerLockWindowSec}s · USDT lock {data.timing.evmLockDurationSec}s · BTQ lock {data.timing.btqLockBlocks} blocks · seller budget {data.timing.sellerBudgetSec}s
+          Timelocks: buyer window {data.timing.buyerLockWindowSec}s · {solana ? 'Solana' : 'USDT'} lock {data.timing.evmLockDurationSec}s · BTQ lock {data.timing.btqLockBlocks} blocks · seller budget {data.timing.sellerBudgetSec}s
         </span>
         <span>{error ? <span className="text-bad">last refresh failed: {error}</span> : `updated ${ago(at, now)}`}</span>
       </footer>

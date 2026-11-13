@@ -1,5 +1,7 @@
 # BTQ Swap runbooks
 
+Agent procedures, with stop conditions and the exact commands, are in [../sops/README.md](../sops/README.md). This page is the short human version.
+
 Compose alias used below (on the VPS, in `/opt/btq-swap`):
 
 ```bash

@@ -4,29 +4,25 @@ import { createBrowserRouter, NavLink, Outlet, RouterProvider } from 'react-rout
 import { AdminPage } from './pages/Admin';
 import { MonitorPage } from './pages/Monitor';
 import { SwapPage } from './pages/SwapPage';
+import { TradeDesk } from './pages/TradeDesk';
 import './index.css';
 
 function Shell() {
-  const link = ({ isActive }: { isActive: boolean }) => `rounded-md px-3 py-1.5 text-sm ${isActive ? 'bg-ink-3 text-fog' : 'text-fog-3 hover:text-fog-2'}`;
+  const link = ({ isActive }: { isActive: boolean }) =>
+    `rounded-control px-3 py-1.5 text-[13px] font-medium ${isActive ? 'bg-white/10 text-fog' : 'text-fog-3 hover:text-fog'}`;
   return (
-    <div className="min-h-screen">
-      <nav className="border-b border-ink-line bg-ink/90 backdrop-blur">
-        <div className="mx-auto flex max-w-7xl items-center justify-between px-5 py-3">
-          <NavLink to="/" className="flex items-center gap-2.5 font-semibold text-fog">
-            <svg width="22" height="22" viewBox="0 0 32 32" aria-hidden>
-              <path d="M5 10h22M5 22h22" stroke="#38BDF8" strokeWidth="3" strokeLinecap="round" />
-              <path d="M5 22h22" stroke="#A78BFA" strokeWidth="3" strokeLinecap="round" />
-              <circle cx="16" cy="16" r="4" fill="#F5C451" />
-            </svg>
-            BTQ Swap
-          </NavLink>
-          <div className="flex items-center gap-1">
-            <NavLink to="/" end className={link}>Monitor</NavLink>
-            <NavLink to="/admin" className={link}>Operator</NavLink>
-            <a href="/downloads/btq-htlc.mjs" className="rounded-md px-3 py-1.5 text-sm text-fog-3 hover:text-fog-2">btq-htlc tool</a>
-          </div>
-        </div>
-      </nav>
+    <div className="min-h-screen bg-ink text-fog">
+      <header className="flex h-12 items-center justify-between border-b border-white/10 px-4">
+        <NavLink to="/" className="flex items-center gap-2 font-semibold tracking-tight text-fog">
+          <img src="/btq-mark.svg" alt="" width="22" height="22" />
+          BTQ Swap
+        </NavLink>
+        <nav className="flex items-center gap-1" aria-label="Sections">
+          <NavLink to="/" end className={link}>Trade</NavLink>
+          <NavLink to="/monitor" className={link}>Monitor</NavLink>
+          <NavLink to="/admin" className={link}>Operator</NavLink>
+        </nav>
+      </header>
       <Outlet />
     </div>
   );
@@ -36,7 +32,8 @@ const router = createBrowserRouter([
   {
     element: <Shell />,
     children: [
-      { index: true, element: <MonitorPage /> },
+      { index: true, element: <TradeDesk /> },
+      { path: 'monitor', element: <MonitorPage /> },
       { path: 'swap/:id', element: <SwapPage /> },
       { path: 'admin', element: <AdminPage /> },
     ],

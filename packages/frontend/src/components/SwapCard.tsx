@@ -32,7 +32,7 @@ export function Clocks({ swap, chains, now }: { swap: SwapView; chains: MonitorS
   }
   if (swap.evm.deadline && !swap.evm.claimTx && !swap.evm.refundTx) {
     const t = new Date(swap.evm.deadline).getTime();
-    items.push({ label: 'USDT lock expires', value: countdown(t, now), tone: t < now ? 'text-warn' : undefined });
+    items.push({ label: swap.rail === 'solana' ? 'Solana lock expires' : 'USDT lock expires', value: countdown(t, now), tone: t < now ? 'text-warn' : undefined });
   }
   if (!items.length) return null;
   return (

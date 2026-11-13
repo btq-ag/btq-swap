@@ -52,7 +52,7 @@ export function Braid({ swap, compact = false }: { swap: SwapView; compact?: boo
 
   return (
     <svg viewBox={`0 0 ${W} ${compact ? 76 : 84}`} className="w-full max-w-[620px]" role="img" aria-label={`Swap ${swap.shortId}: ${swap.statusLabel}`}>
-      <text x={0} y={Y_EVM + 4} fill={C.evm} fontSize="12" fontWeight={600}>USDT · EVM</text>
+      <text x={0} y={Y_EVM + 4} fill={C.evm} fontSize="12" fontWeight={600}>{swap.rail === 'solana' ? 'USDT · Solana' : 'USDT · EVM'}</text>
       <text x={0} y={Y_BTQ + 4} fill={C.btq} fontSize="12" fontWeight={600}>BTQ · P2MR</text>
 
       {/* lanes: solid where the chain has progressed, faint ahead */}

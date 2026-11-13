@@ -11,6 +11,7 @@ export const SETTINGS_SCHEMA = {
   mm_max_notional_usdt: decimal,
   mm_max_order_btq: decimal,
   mm_min_spread_pct: decimal,
+  settlement_rail: z.enum(['evm', 'solana']),
 } as const;
 
 export type SettingKey = keyof typeof SETTINGS_SCHEMA;
@@ -23,6 +24,7 @@ const DEFAULTS: Settings = {
   mm_max_notional_usdt: '100000',
   mm_max_order_btq: '500',
   mm_min_spread_pct: '0.5',
+  settlement_rail: 'evm',
 };
 
 export async function getSettings(q: Queryable = db()): Promise<Settings> {

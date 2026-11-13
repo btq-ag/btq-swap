@@ -78,6 +78,7 @@ export function AdminPage() {
   if (authed === null) return null;
   if (!authed) return <Login onDone={() => setAuthed(true)} />;
   const paused = ov?.settings.book_paused === true;
+  const rail = ov?.settings.settlement_rail === 'solana' ? 'solana' : 'evm';
 
   return (
     <main className="mx-auto max-w-6xl space-y-6 px-5 pb-16 pt-6">
@@ -85,6 +86,19 @@ export function AdminPage() {
         <h1 className="text-2xl font-semibold text-fog">Operator console</h1>
         <div className="flex items-center gap-3">
           {msg && <span className="text-sm text-fog-2">{msg}</span>}
+          <div className="flex rounded-lg border border-ink-line p-0.5" role="group" aria-label="Settlement rail">
+            {(['evm', 'solana'] as const).map((item) => (
+              <button
+                key={item}
+                type="button"
+                aria-pressed={rail === item}
+                onClick={() => { if (rail !== item) void act(() => adminFetch('/settings', 'POST', { key: 'settlement_rail', value: item }), item === 'solana' ? 'Solana rail' : 'EVM rail'); }}
+                className={`rounded-md px-3 py-1.5 text-sm font-medium ${rail === item ? 'bg-btq text-ink' : 'text-fog-3'}`}
+              >
+                {item === 'evm' ? 'EVM' : 'Solana'}
+              </button>
+            ))}
+          </div>
           <button
             onClick={() => act(() => adminFetch('/settings', 'POST', { key: 'book_paused', value: !paused }), paused ? 'Book resumed' : 'Book paused')}
             className={`rounded-lg px-4 py-2 text-sm font-medium ${paused ? 'bg-ok text-ink' : 'bg-warn text-ink'}`}

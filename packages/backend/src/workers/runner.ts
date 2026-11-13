@@ -4,6 +4,7 @@ import { createLogger } from '../lib/logger';
 import { setBtqTipProvider } from '../domain/settlement';
 import { btqStatus, btqTick, processLockHints } from './btq-watcher';
 import { evmTick } from './evm-watcher';
+import { solanaTick } from './solana-watcher';
 import { feedTick } from './feed';
 import { notifierTick } from './notifier';
 import { platformTick } from './platform-agent';
@@ -39,6 +40,7 @@ export function startWorkers(): RunnerHandle {
   const settlement = loop('settlement', config().WORKER_TICK_MS, async () => {
     const tip = await btqTick();
     await evmTick(async () => btqStatus.tip || tip);
+    await solanaTick();
     await processLockHints();
     await platformTick(tip);
   });

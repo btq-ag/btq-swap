@@ -1,9 +1,13 @@
+import { useState } from 'react';
 import type { MonitorState } from '../api';
 import { ago, trimAmount } from '../hooks';
 
 const EVENT_TEXT: Record<string, string> = {
   matched: 'matched',
   evm_locked: 'USDT locked on EVM',
+  solana_locked: 'tokens locked on Solana',
+  solana_claimed: 'tokens claimed on Solana',
+  solana_refunded: 'tokens refunded on Solana',
   evm_lock_confirmed: 'USDT lock confirmed · BTQ HTLC address issued',
   btq_locked: 'BTQ locked in P2MR HTLC',
   btq_lock_confirmed: 'BTQ lock confirmed',
@@ -25,13 +29,29 @@ const EVENT_TEXT: Record<string, string> = {
   btq_lock_hint: 'seller reported lock txid',
 };
 
+function Pager({ page, pages, onPage }: { page: number; pages: number; onPage: (n: number) => void }) {
+  if (pages <= 1) return null;
+  return (
+    <div className="mt-3 flex items-center justify-between text-xs text-fog-3">
+      <button type="button" disabled={page <= 1} onClick={() => onPage(page - 1)} className="disabled:opacity-40">Previous</button>
+      <span className="tabular-nums">{page} / {pages}</span>
+      <button type="button" disabled={page >= pages} onClick={() => onPage(page + 1)} className="disabled:opacity-40">Next</button>
+    </div>
+  );
+}
+
 export function EventStream({ events, now }: { events: MonitorState['events']; now: number }) {
+  const pageSize = 8;
+  const [page, setPage] = useState(1);
+  const pages = Math.max(1, Math.ceil(events.length / pageSize));
+  const current = Math.min(page, pages);
+  const shown = events.slice((current - 1) * pageSize, current * pageSize);
   return (
     <section className="panel p-4" aria-labelledby="ev-h">
       <h2 id="ev-h" className="text-sm font-semibold text-fog">Settlement log</h2>
-      <ol className="mt-3 max-h-[420px] space-y-2 overflow-y-auto pr-1 text-sm">
-        {events.length === 0 && <li className="text-fog-3">Nothing has happened yet. Run a swap from Discord with <code className="hash">/swap buy</code>.</li>}
-        {events.map((e, i) => {
+      <ol className="mt-3 space-y-2 pr-1 text-sm">
+        {shown.length === 0 && <li className="text-fog-3">Nothing has happened yet. Run a swap from Discord with <code className="hash">/swap buy</code>.</li>}
+        {shown.map((e, i) => {
           const tone = e.type.includes('reject') || e.type.includes('passed') ? 'text-warn' : e.type.includes('refund') ? 'text-warn' : e.type.includes('claimed') ? 'text-key' : 'text-fog-2';
           return (
             <li key={`${e.swap}-${e.at}-${i}`} className="flex gap-3">
@@ -45,6 +65,7 @@ export function EventStream({ events, now }: { events: MonitorState['events']; n
           );
         })}
       </ol>
+      <Pager page={current} pages={pages} onPage={setPage} />
     </section>
   );
 }
@@ -99,12 +120,17 @@ export function InventoryPanel({ inv }: { inv: MonitorState['inventory'] }) {
 }
 
 export function NotificationPanel({ items, now }: { items: MonitorState['notifications']; now: number }) {
+  const pageSize = 6;
+  const [page, setPage] = useState(1);
+  const pages = Math.max(1, Math.ceil(items.length / pageSize));
+  const current = Math.min(page, pages);
+  const shown = items.slice((current - 1) * pageSize, current * pageSize);
   return (
     <section className="panel p-4" aria-labelledby="dm-h">
       <h2 id="dm-h" className="text-sm font-semibold text-fog">Discord DMs</h2>
-      <ul className="mt-3 max-h-60 space-y-1.5 overflow-y-auto text-sm">
-        {items.length === 0 && <li className="text-fog-3">No messages yet.</li>}
-        {items.map((n, i) => (
+      <ul className="mt-3 space-y-1.5 text-sm">
+        {shown.length === 0 && <li className="text-fog-3">No messages yet.</li>}
+        {shown.map((n, i) => (
           <li key={i} className="flex gap-2">
             <span className={`w-16 shrink-0 text-xs ${n.status === 'sent' ? 'text-ok' : n.status === 'failed' ? 'text-bad' : 'text-fog-4'}`}>{n.status}</span>
             <span className="flex-1 truncate text-fog-2" title={n.title}>
@@ -114,6 +140,7 @@ export function NotificationPanel({ items, now }: { items: MonitorState['notific
           </li>
         ))}
       </ul>
+      <Pager page={current} pages={pages} onPage={setPage} />
     </section>
   );
 }

@@ -60,21 +60,26 @@ export async function acceptTos(userId: string, version = config().TOS_VERSION):
   });
 }
 
-export function linkStatus(u: UserRow): { tos: boolean; evm: boolean; btq: boolean } {
+export function linkStatus(u: UserRow): { tos: boolean; evm: boolean; btq: boolean; sol: boolean } {
   return {
     tos: !!u.tos_accepted_at && u.tos_version === config().TOS_VERSION,
     evm: !!u.eth_address && !!u.eth_verified_at,
+    sol: !!u.sol_address,
     btq: !!u.dilithium_pubkey && !!u.btq_pubkey_verified_at && !!u.btq_address,
   };
 }
 
 /** Throws a user-facing DomainError unless the user may trade. */
-export function assertCanTrade(u: UserRow): void {
+export function assertCanTrade(u: UserRow, rail: 'evm' | 'solana' = 'evm'): void {
   if (u.is_banned) throw new DomainError('USER_BANNED', 'This account is not available.');
   if (u.is_platform) return;
   const s = linkStatus(u);
   if (!s.tos) throw new DomainError('TOS_REQUIRED', 'Accept the terms first with `/swap start`.');
-  if (!s.evm) throw new DomainError('LINK_REQUIRED', 'Link your EVM wallet first with `/swap link-evm`.');
+  if (rail === 'solana') {
+    if (!s.sol) throw new DomainError('LINK_REQUIRED', 'Link your Solana wallet before trading on the Solana rail.');
+  } else if (!s.evm) {
+    throw new DomainError('LINK_REQUIRED', 'Link your EVM wallet first with `/swap link-evm`.');
+  }
   if (!s.btq) throw new DomainError('LINK_REQUIRED', 'Link your BTQ swap key first with `/swap link-btq`.');
 }
 

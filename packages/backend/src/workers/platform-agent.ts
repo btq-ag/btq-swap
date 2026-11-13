@@ -2,6 +2,9 @@ import { buildClaimTx, buildRefundTx, btqNetworkTag, swapBindingAsset } from '@b
 import { config } from '../config';
 import { btqChain } from '../chains/btq';
 import { evmChain } from '../chains/evm';
+import { buildHtlcTransaction } from '../chains/solana-htlc';
+import { platformSolanaKeypair, solanaMint, solanaProgramId, withSolana } from '../chains/solana';
+import { PublicKey } from '@solana/web3.js';
 import { decryptSecret } from '../lib/crypto';
 import { db, many, one } from '../lib/db';
 import { createLogger } from '../lib/logger';
@@ -39,6 +42,33 @@ async function once(s: SwapRow, kind: string, fn: () => Promise<Record<string, u
   }
 }
 
+async function platformSolana(s: SwapRow, action: 'lock' | 'withdraw' | 'refund'): Promise<string> {
+  const key = platformSolanaKeypair();
+  const deadline = action === 'lock'
+    ? BigInt(Math.floor(Date.now() / 1000) + config().SWAP_EVM_LOCK_DURATION_SEC)
+    : BigInt(Math.floor(new Date(s.evm_deadline!).getTime() / 1000));
+  const sig = await withSolana(async (connection) => {
+    const tx = await buildHtlcTransaction({
+      connection,
+      programId: solanaProgramId(),
+      mint: solanaMint(),
+      feePayer: key.publicKey,
+      action,
+      partyA: new PublicKey(s.buyer_sol!),
+      partyB: new PublicKey(s.seller_sol!),
+      amount: BigInt(s.amount_usdt_units),
+      secretHash: Buffer.from(s.secret_hash!, 'hex'),
+      deadline,
+      preimage: action === 'withdraw' ? Buffer.from(s.revealed_preimage!, 'hex') : undefined,
+    });
+    tx.partialSign(key);
+    const sent = await connection.sendRawTransaction(tx.serialize());
+    await connection.confirmTransaction(sent, 'confirmed');
+    return sent;
+  });
+  return sig;
+}
+
 export async function platformTick(tip: number): Promise<void> {
   await refreshInventory().catch((err) => log.warn('inventory refresh failed', { err: (err as Error).message }));
   const platform = await getPlatformUser();
@@ -56,7 +86,9 @@ export async function platformTick(tip: number): Promise<void> {
   for (const s of swaps) {
     const isBuyer = s.buyer_user_id === platform.id;
     try {
-      if (isBuyer && s.status === 'awaiting_buyer_lock' && !s.evm_agreement_id) {
+      if (isBuyer && s.status === 'awaiting_buyer_lock' && !s.evm_agreement_id && s.settlement_rail === 'solana') {
+        await once(s, 'solana_lock', async () => ({ signature: await platformSolana(s, 'lock') }));
+      } else if (isBuyer && s.status === 'awaiting_buyer_lock' && !s.evm_agreement_id) {
         await once(s, 'evm_lock', async () => {
           const r = await evm.platformLock({
             partyB: s.seller_eth,
@@ -90,6 +122,8 @@ export async function platformTick(tip: number): Promise<void> {
           const txid = await btq.broadcast(signed.hex);
           return { txid, feeSats: signed.feeSats.toString(), to: dest };
         });
+      } else if (!isBuyer && s.status === 'awaiting_seller_claim' && s.revealed_preimage && s.evm_agreement_id && !s.evm_claim_tx && s.settlement_rail === 'solana') {
+        await once(s, 'solana_claim', async () => ({ signature: await platformSolana(s, 'withdraw') }));
       } else if (!isBuyer && s.status === 'awaiting_seller_claim' && s.revealed_preimage && s.evm_agreement_id && !s.evm_claim_tx) {
         await once(s, 'evm_claim', async () => ({ txHash: await evm.platformWithdraw(s.evm_agreement_id!, s.revealed_preimage!) }));
       } else if (!isBuyer && s.status === 'awaiting_refunds' && s.btq_lock_txid && !s.btq_claim_txid && !s.btq_refund_txid && tip >= (s.btq_refund_locktime ?? Infinity)) {
@@ -105,6 +139,14 @@ export async function platformTick(tip: number): Promise<void> {
           const txid = await btq.broadcast(signed.hex);
           return { txid, feeSats: signed.feeSats.toString(), to: dest };
         });
+      } else if (
+        isBuyer &&
+        ['awaiting_buyer_refund', 'awaiting_refunds'].includes(s.status) &&
+        s.evm_agreement_id && !s.evm_refund_tx && !s.evm_claim_tx &&
+        s.evm_deadline && chainNow >= Math.floor(s.evm_deadline.getTime() / 1000) &&
+        s.settlement_rail === 'solana'
+      ) {
+        await once(s, 'solana_refund', async () => ({ signature: await platformSolana(s, 'refund') }));
       } else if (
         isBuyer &&
         ['awaiting_buyer_refund', 'awaiting_refunds'].includes(s.status) &&

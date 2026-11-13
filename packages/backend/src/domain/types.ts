@@ -28,6 +28,7 @@ export interface UserRow {
   discord_id: string | null;
   discord_username: string | null;
   eth_address: string | null;
+  sol_address: string | null;
   btq_address: string | null;
   dilithium_pubkey: string | null;
   role: string | null;
@@ -75,6 +76,9 @@ export interface SwapRow {
   amount_usdt_units: string;
   buyer_eth: string;
   seller_eth: string;
+  settlement_rail: 'evm' | 'solana';
+  buyer_sol: string | null;
+  seller_sol: string | null;
   buyer_btq_pubkey: string;
   seller_btq_pubkey: string;
   buyer_btq_address: string | null;

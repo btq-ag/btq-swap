@@ -9,6 +9,8 @@ import { usdtDisplay } from './instructions';
 import { fromUnits } from './money';
 import { partyLabel, protocolSteps, statusTone } from './present';
 import { getSwap, htlcForSwap, swapEvents } from './settlement';
+import { getSettings } from './settings';
+import { solanaStatus } from '../workers/solana-watcher';
 import { ACTIVE_STATUSES, STATUS_LABEL, type SwapRow, type UserRow } from './types';
 
 type Party = Pick<UserRow, 'id' | 'is_platform' | 'is_simulated' | 'discord_username' | 'discord_id'>;
@@ -58,6 +60,7 @@ export function swapView(s: SwapRow, parties: Map<string, Party>) {
       claimTxid: s.btq_claim_txid,
       refundTxid: s.btq_refund_txid,
     },
+    rail: s.settlement_rail === 'solana' ? 'solana' as const : 'evm' as const,
     deadlines: { buyerLockBy: s.buyer_lock_by, sellerLockBy: s.seller_lock_by },
     failureReason: s.failure_reason,
     createdAt: s.created_at,
@@ -109,7 +112,9 @@ export async function monitorState() {
     chains: {
       btq: { network: c.BTQ_NETWORK, tip: btqStatus.tip, tipHash: btqStatus.tipHash, mempool: btqStatus.mempool, lastTickAt: btqStatus.lastTickAt, targetBlockSec: c.BTQ_TARGET_BLOCK_SEC, minConfirmations: c.BTQ_MIN_CONFIRMATIONS },
       evm: { chainId: c.EVM_CHAIN_ID, head: evmStatus.head, lastTickAt: evmStatus.lastTickAt, minConfirmations: c.EVM_MIN_CONFIRMATIONS },
+      solana: { slot: solanaStatus.slot, lastTickAt: solanaStatus.lastTickAt, reachable: solanaStatus.reachable },
     },
+    settlementRail: (await getSettings()).settlement_rail,
     timing: {
       buyerLockWindowSec: c.SWAP_BUYER_LOCK_WINDOW_SEC,
       evmLockDurationSec: c.SWAP_EVM_LOCK_DURATION_SEC,
@@ -145,6 +150,54 @@ export async function monitorState() {
     events: events.map((e) => ({ swap: Number(e.short_id), type: e.event_type, from: e.from_status, to: e.to_status, actor: e.actor, meta: e.metadata, at: e.created_at })),
     notifications: notifications.map((n) => ({ kind: n.kind, status: n.status, title: n.title, at: n.created_at, user: n.is_simulated ? `${n.username} (sim)` : n.username ? `${n.username.slice(0, 3)}…` : 'user' })),
   };
+}
+
+const SWAP_FILTERS = ['active', 'completed', 'refunds', 'all'] as const;
+export type SwapFilter = (typeof SWAP_FILTERS)[number];
+
+function filterSql(filter: SwapFilter): { sql: string; params: unknown[] } {
+  if (filter === 'completed') return { sql: `status = 'completed'`, params: [] };
+  if (filter === 'refunds') return { sql: `status IN ('refunded', 'expired', 'failed')`, params: [] };
+  if (filter === 'all') return { sql: 'TRUE', params: [] };
+  return { sql: `(status = ANY($1) OR status IN ('awaiting_buyer_refund', 'awaiting_refunds'))`, params: [ACTIVE_STATUSES as unknown as string[]] };
+}
+
+/** Page through swaps. `q` matches a swap number or any lock, claim, refund, or agreement id. */
+export async function searchSwaps(rawQ: string, filter: SwapFilter, page: number, limit: number) {
+  const q = rawQ.trim().slice(0, 128);
+  const like = `%${q.replace(/[\\%_]/g, (ch) => `\\${ch}`)}%`;
+  const size = Math.min(50, Math.max(1, limit));
+  const current = Math.max(1, page);
+  const { sql: statusSql, params: statusParams } = filterSql(filter);
+  const qIndex = statusParams.length + 1;
+  const likeIndex = qIndex + 1;
+  const where = `${statusSql} AND (
+    $${qIndex} = ''
+    OR short_id::text = $${qIndex}
+    OR evm_lock_tx ILIKE $${likeIndex} ESCAPE '\\'
+    OR evm_claim_tx ILIKE $${likeIndex} ESCAPE '\\'
+    OR evm_refund_tx ILIKE $${likeIndex} ESCAPE '\\'
+    OR evm_agreement_id ILIKE $${likeIndex} ESCAPE '\\'
+    OR btq_lock_txid ILIKE $${likeIndex} ESCAPE '\\'
+    OR btq_claim_txid ILIKE $${likeIndex} ESCAPE '\\'
+    OR btq_refund_txid ILIKE $${likeIndex} ESCAPE '\\'
+    OR btq_htlc_address ILIKE $${likeIndex} ESCAPE '\\'
+    OR buyer_sol ILIKE $${likeIndex} ESCAPE '\\'
+    OR seller_sol ILIKE $${likeIndex} ESCAPE '\\'
+    OR buyer_eth ILIKE $${likeIndex} ESCAPE '\\'
+    OR seller_eth ILIKE $${likeIndex} ESCAPE '\\'
+  )`;
+  const args = [...statusParams, q, like];
+  const total = Number((await one<{ n: string }>(db(), `SELECT COUNT(*)::text AS n FROM swaps WHERE ${where}`, args))?.n ?? 0);
+  const pages = Math.max(1, Math.ceil(total / size));
+  const safePage = Math.min(current, pages);
+  const rows = await many<SwapRow>(
+    db(),
+    `SELECT * FROM swaps WHERE ${where} ORDER BY created_at DESC LIMIT $${args.length + 1} OFFSET $${args.length + 2}`,
+    [...args, size, (safePage - 1) * size],
+  );
+  const parties = await partiesFor(rows);
+  return { swaps: rows.map((s) => swapView(s, parties)), total, page: safePage, pageSize: size, pages };
 }
 
 /** Public descriptor consumed by the btq-htlc CLI (all data is on-chain or derivable from it). */

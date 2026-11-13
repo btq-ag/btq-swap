@@ -15,6 +15,7 @@ import { encryptSecret } from '../lib/crypto';
 import { db, many, one, tx, type Queryable } from '../lib/db';
 import { createLogger } from '../lib/logger';
 import { DomainError } from './errors';
+import { getSettings } from './settings';
 import { instructionFor, usdtDisplay } from './instructions';
 import { fromUnits, usdtUnitsFor } from './money';
 import { enqueueNotification } from './outbox';
@@ -143,7 +144,15 @@ export async function createSwapForFill(c: Queryable, f: FillInput): Promise<Swa
   const takerBuys = f.takerOrder.side === 'buy';
   const buyer = takerBuys ? f.taker : f.maker;
   const seller = takerBuys ? f.maker : f.taker;
-  if (!buyer.eth_address || !seller.eth_address || !buyer.dilithium_pubkey || !seller.dilithium_pubkey) {
+  const rail = (await getSettings(c)).settlement_rail;
+  if (rail === 'solana') {
+    if (!buyer.sol_address || !seller.sol_address || !buyer.dilithium_pubkey || !seller.dilithium_pubkey) {
+      throw new DomainError('LINK_REQUIRED', 'both parties must have linked Solana and BTQ wallets');
+    }
+    if (!config().SOLANA_HTLC_PROGRAM_ID || !config().SOLANA_TOKEN_MINT) {
+      throw new DomainError('VALIDATION', 'The Solana rail is not configured.');
+    }
+  } else if (!buyer.eth_address || !seller.eth_address || !buyer.dilithium_pubkey || !seller.dilithium_pubkey) {
     throw new DomainError('LINK_REQUIRED', 'both parties must have linked wallets');
   }
   const units = usdtUnitsFor(f.fillSats, f.priceUsdt, config().USDT_DECIMALS);
@@ -163,14 +172,20 @@ export async function createSwapForFill(c: Queryable, f: FillInput): Promise<Swa
        maker_order_id, taker_order_id, maker_user_id, taker_user_id, buyer_user_id, seller_user_id, status,
        amount_btq, amount_sats, price_usdt, amount_usdt, amount_usdt_units,
        buyer_eth, seller_eth, buyer_btq_pubkey, seller_btq_pubkey, buyer_btq_address, seller_btq_address,
-       secret_hash, platform_secret_enc, evm_chain_id, evm_htlc_contract, evm_token, btq_network, buyer_lock_by
-     ) VALUES ($1,$2,$3,$4,$5,$6,'awaiting_buyer_lock',$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23, now() + ($24::text || ' seconds')::interval)
+       secret_hash, platform_secret_enc, evm_chain_id, evm_htlc_contract, evm_token, btq_network, buyer_lock_by,
+       settlement_rail, buyer_sol, seller_sol
+     ) VALUES ($1,$2,$3,$4,$5,$6,'awaiting_buyer_lock',$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23, now() + ($24::text || ' seconds')::interval,$25,$26,$27)
      RETURNING *`,
     [
       f.makerOrder.id, f.takerOrder.id, f.maker.id, f.taker.id, buyer.id, seller.id,
       fromUnits(f.fillSats, 8), f.fillSats.toString(), f.priceUsdt, fromUnits(units, config().USDT_DECIMALS), units.toString(),
-      buyer.eth_address.toLowerCase(), seller.eth_address.toLowerCase(), buyer.dilithium_pubkey, seller.dilithium_pubkey, buyer.btq_address, seller.btq_address,
-      secretHash, platformSecret, f.evm.chainId, f.evm.htlc.toLowerCase(), f.evm.token.toLowerCase(), config().BTQ_NETWORK, String(config().SWAP_BUYER_LOCK_WINDOW_SEC),
+      (buyer.eth_address ?? buyer.sol_address ?? '').toLowerCase(), (seller.eth_address ?? seller.sol_address ?? '').toLowerCase(), buyer.dilithium_pubkey, seller.dilithium_pubkey, buyer.btq_address, seller.btq_address,
+      secretHash, platformSecret,
+      rail === 'solana' ? 0 : f.evm.chainId,
+      rail === 'solana' ? config().SOLANA_HTLC_PROGRAM_ID : f.evm.htlc.toLowerCase(),
+      rail === 'solana' ? config().SOLANA_TOKEN_MINT : f.evm.token.toLowerCase(),
+      config().BTQ_NETWORK, String(config().SWAP_BUYER_LOCK_WINDOW_SEC),
+      rail, buyer.sol_address, seller.sol_address,
     ],
   );
   await recordEvent(c, swap!.id, 'matched', {
@@ -268,6 +283,50 @@ export async function onEvmLockup(ev: LockupObservation, headBlock: number, nowS
     }, { agreementId: ev.agreementId, txHash: ev.txHash, deadline: ev.deadline, amount: ev.tokenAmount.toString() });
     if (updated && confs >= config().EVM_MIN_CONFIRMATIONS) await enterAwaitingSellerLock(c, updated, null);
   });
+}
+
+export async function observeSolanaAccount(input: {
+  partyA: string;
+  partyB: string;
+  mint: string;
+  secretHashHex: string;
+  deadline: number;
+  amount: bigint;
+  withdrawn: boolean;
+  refunded: boolean;
+  preimageHex: string;
+  agreementHex: string;
+  signature: string | null;
+}): Promise<void> {
+  const nowSec = Math.floor(Date.now() / 1000);
+  await tx(async (c) => {
+    const s = await one<SwapRow>(
+      c,
+      `SELECT * FROM swaps
+        WHERE settlement_rail = 'solana' AND buyer_sol = $1 AND seller_sol = $2 AND evm_token = $3
+          AND (evm_agreement_id = $4 OR (evm_agreement_id IS NULL AND status = 'awaiting_buyer_lock' AND amount_usdt_units <= $5))
+        ORDER BY CASE WHEN evm_agreement_id = $4 THEN 0 ELSE 1 END, created_at
+        LIMIT 1 FOR UPDATE`,
+      [input.partyA, input.partyB, input.mint, input.agreementHex, input.amount.toString()],
+    );
+    if (!s || s.evm_agreement_id) return;
+    if (s.status !== 'awaiting_buyer_lock' || input.refunded) return;
+    const remaining = input.deadline - nowSec;
+    if (remaining < sellerTimeBudgetSec() + 60 || remaining > config().SWAP_EVM_LOCK_MAX_DURATION_SEC + 120) return;
+    if (s.secret_hash && s.secret_hash !== input.secretHashHex) return;
+    const updated = await transition(c, s.id, ['awaiting_buyer_lock'], 'buyer_lock_confirming', 'solana_locked', {
+      secret_hash: input.secretHashHex,
+      evm_agreement_id: input.agreementHex,
+      evm_lock_tx: input.signature,
+      evm_deadline: new Date(input.deadline * 1000),
+      evm_lock_confs: config().EVM_MIN_CONFIRMATIONS,
+    }, { agreementId: input.agreementHex, signature: input.signature, amount: input.amount.toString() });
+    if (updated) await enterAwaitingSellerLock(c, updated, null);
+  });
+  if (input.withdrawn && input.preimageHex && !/^0+$/.test(input.preimageHex)) {
+    await onEvmClaimed(input.agreementHex, input.signature ?? input.agreementHex, input.preimageHex);
+  }
+  if (input.refunded) await onEvmRefunded(input.agreementHex, input.signature ?? input.agreementHex);
 }
 
 /** Called each tick for buyer_lock_confirming swaps. */

@@ -16,3 +16,7 @@ deploy/.env*
 !deploy/.env.example
 deploy/btqd/bin/
 packages/backend/.env.legacy.bak
+packages/solana-htlc/target/
+test-ledger/
+__pycache__/
+*.pyc

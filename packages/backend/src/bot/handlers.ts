@@ -17,6 +17,7 @@ import {
 } from '../domain/identity';
 import { cliUrl, instructionFor, timingSummary, usdtDisplay } from '../domain/instructions';
 import { loadInventory } from '../domain/inventory';
+import { getSettings } from '../domain/settings';
 import { fromUnits } from '../domain/money';
 import { hintBtqLock, summaryLine, swapForUser, swapsForUser } from '../domain/settlement';
 import { STATUS_LABEL, type UserRow } from '../domain/types';
@@ -180,7 +181,7 @@ export async function book(_i: BotInteraction, _ctx: Ctx, r: Responder): Promise
 }
 
 export async function orderForm(_i: BotInteraction, ctx: Ctx, r: Responder, side: 'buy' | 'sell'): Promise<void> {
-  assertCanTrade(requireUser(ctx));
+  assertCanTrade(requireUser(ctx), (await getSettings()).settlement_rail);
   const b = await publicBook(1);
   const hint = side === 'buy' ? b.bestAsk : b.bestBid;
   await r.modal(
@@ -215,7 +216,7 @@ export async function orderSubmitted(i: BotInteraction, ctx: Ctx, r: Responder, 
 }
 
 export async function takeForm(i: BotInteraction, ctx: Ctx, r: Responder): Promise<void> {
-  assertCanTrade(requireUser(ctx));
+  assertCanTrade(requireUser(ctx), (await getSettings()).settlement_rail);
   const n = i.options?.getInteger('order', true);
   const o = await getOrder(String(n));
   if (!o || !['open', 'partially_filled'].includes(o.status)) throw new DomainError('NOT_FOUND', `Order #${n} is not on the book.`);
