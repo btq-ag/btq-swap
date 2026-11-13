@@ -1,0 +1,11 @@
+[package]
+name = "btq-sol-htlc"
+version = "0.1.0"
+edition = "2021"
+description = "SPL-token HTLC used as the Solana rail of a BTQ atomic swap"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+solana-program = "=2.1.0"

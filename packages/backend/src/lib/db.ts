@@ -1,63 +1,53 @@
-import { Pool, QueryResult, QueryResultRow } from 'pg';
+import { Pool, type PoolClient, type QueryResultRow } from 'pg';
 import { config } from '../config';
 
-const pool = new Pool({
-  connectionString: config.DATABASE_URL,
-  max: 20,
-  idleTimeoutMillis: 30_000,
-  connectionTimeoutMillis: 5_000,
-});
+let _pool: Pool | null = null;
 
-pool.on('error', (err) => {
-  console.error('Unexpected PG pool error:', err);
-});
-
-export async function query<T extends QueryResultRow = QueryResultRow>(
-  text: string,
-  params?: unknown[],
-): Promise<QueryResult<T>> {
-  const start = Date.now();
-  const result = await pool.query<T>(text, params);
-  const duration = Date.now() - start;
-  if (duration > 1000) {
-    console.warn(`Slow query (${duration}ms):`, text.slice(0, 120));
+export function pool(): Pool {
+  if (!_pool) {
+    _pool = new Pool({ connectionString: config().DATABASE_URL, max: 15, idleTimeoutMillis: 30_000, connectionTimeoutMillis: 5_000 });
+    _pool.on('error', (err) => console.error('[db] pool error', err.message));
   }
-  return result;
+  return _pool;
 }
 
-export async function getOne<T extends QueryResultRow = QueryResultRow>(
-  text: string,
-  params?: unknown[],
-): Promise<T | null> {
-  const result = await query<T>(text, params);
-  return result.rows[0] ?? null;
+export async function closePool(): Promise<void> {
+  if (_pool) {
+    const p = _pool;
+    _pool = null;
+    await p.end();
+  }
 }
 
-export async function getMany<T extends QueryResultRow = QueryResultRow>(
-  text: string,
-  params?: unknown[],
-): Promise<T[]> {
-  const result = await query<T>(text, params);
-  return result.rows;
+/** Anything that can run a query: the pool or a transaction client. */
+export interface Queryable {
+  query<R extends QueryResultRow = QueryResultRow>(text: string, params?: unknown[]): Promise<{ rows: R[]; rowCount: number | null }>;
 }
 
-export async function withTransaction<T>(
-  fn: (queryFn: typeof query) => Promise<T>,
-): Promise<T> {
-  const client = await pool.connect();
+export function db(): Queryable {
+  return pool() as unknown as Queryable;
+}
+
+export async function one<R extends QueryResultRow>(q: Queryable, text: string, params: unknown[] = []): Promise<R | null> {
+  const r = await q.query<R>(text, params);
+  return r.rows[0] ?? null;
+}
+
+export async function many<R extends QueryResultRow>(q: Queryable, text: string, params: unknown[] = []): Promise<R[]> {
+  return (await q.query<R>(text, params)).rows;
+}
+
+export async function tx<T>(fn: (client: PoolClient & Queryable) => Promise<T>): Promise<T> {
+  const client = (await pool().connect()) as PoolClient & Queryable;
   try {
     await client.query('BEGIN');
-    const txQuery = <R extends QueryResultRow>(text: string, params?: unknown[]) =>
-      client.query<R>(text, params);
-    const result = await fn(txQuery as typeof query);
+    const out = await fn(client);
     await client.query('COMMIT');
-    return result;
+    return out;
   } catch (err) {
-    await client.query('ROLLBACK');
+    await client.query('ROLLBACK').catch(() => undefined);
     throw err;
   } finally {
     client.release();
   }
 }
-
-export { pool };

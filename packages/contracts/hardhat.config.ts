@@ -26,13 +26,12 @@ const config: HardhatUserConfig = {
 		target: "ethers-v5",
 	},
 	networks: {
+		// Per-transaction gas must stay under the EIP-7825 cap (16,777,216) enforced by Hardhat EDR.
 		localhost: {
-			url: "http://127.0.0.1:8545",
-			gas: 30_000_000,
+			url: process.env.EVM_RPC_URL || "http://127.0.0.1:8545",
 		},
 		hardhat: {
 			blockGasLimit: 60_000_000,
-			gas: 60_000_000,
 			allowUnlimitedContractSize: true,
 		},
 		sepolia: {
