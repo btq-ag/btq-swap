@@ -3,32 +3,65 @@
 @tailwind utilities;
 
 @layer base {
+  html {
+    background: #0f1116;
+    color: #f5f6f8;
+    color-scheme: dark;
+    -webkit-font-smoothing: antialiased;
+  }
+  body {
+    font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+    font-size: 13px;
+    line-height: 1.45;
+  }
   * {
     scrollbar-width: thin;
-    scrollbar-color: #334155 transparent;
+    scrollbar-color: #2a2f3a transparent;
   }
+  :focus-visible {
+    outline: 2px solid #0052ff;
+    outline-offset: 2px;
+  }
+  input, button { font: inherit; }
+}
 
-  *::-webkit-scrollbar {
-    width: 6px;
-    height: 6px;
+@layer components {
+  .num { font-variant-numeric: tabular-nums; font-feature-settings: 'tnum' 1; }
+  .hash {
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+    font-size: 12px;
   }
+  .panel {
+    background: #161920;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 8px;
+  }
+  .hairline { border-color: rgba(255, 255, 255, 0.08); }
+}
 
-  *::-webkit-scrollbar-track {
-    background: transparent;
-  }
+@keyframes tick-up {
+  from { background-color: rgba(0, 200, 130, 0.35); }
+  to { background-color: transparent; }
+}
+@keyframes tick-down {
+  from { background-color: rgba(244, 70, 86, 0.35); }
+  to { background-color: transparent; }
+}
+.tick-up { animation: tick-up 450ms ease-out; }
+.tick-down { animation: tick-down 450ms ease-out; }
 
-  *::-webkit-scrollbar-thumb {
-    background-color: #334155;
-    border-radius: 9999px;
-  }
+@keyframes key-cross {
+  0% { transform: translateY(0); opacity: 0; }
+  20% { opacity: 1; }
+  100% { transform: translateY(-26px); opacity: 1; }
+}
+.key-cross { animation: key-cross 900ms ease-out both; }
+@keyframes pulse-dot {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(0, 200, 130, 0.45); }
+  50% { box-shadow: 0 0 0 6px rgba(0, 200, 130, 0); }
+}
+.pulse-dot { animation: pulse-dot 1.8s ease-in-out infinite; }
 
-  input[type='number']::-webkit-inner-spin-button,
-  input[type='number']::-webkit-outer-spin-button {
-    -webkit-appearance: none;
-    margin: 0;
-  }
-
-  input[type='number'] {
-    -moz-appearance: textfield;
-  }
+@media (prefers-reduced-motion: reduce) {
+  .key-cross, .pulse-dot, .tick-up, .tick-down { animation: none; }
 }

@@ -1,25 +1,16 @@
-FROM node:20-alpine AS builder
+# Monitor + operator console (static) and the btq-htlc single-file download, served by nginx.
+FROM node:24-slim AS build
 WORKDIR /app
-
-COPY package.json package-lock.json ./
+COPY package.json package-lock.json tsconfig.base.json ./
+COPY packages/htlc/package.json packages/htlc/
 COPY packages/frontend/package.json packages/frontend/
-COPY packages/backend/package.json packages/backend/
-COPY packages/contracts/package.json packages/contracts/
-COPY tsconfig.base.json ./
+RUN npm ci --workspace=@btq-swap/htlc --workspace=@btq-swap/frontend --include-workspace-root --ignore-scripts --no-audit --no-fund
+COPY packages/htlc packages/htlc
 COPY packages/frontend packages/frontend
+RUN node packages/htlc/scripts/bundle.mjs && npm run build -w packages/frontend
 
-# Skip native module postinstall scripts (bufferutil/utf-8-validate) in Alpine
-ENV npm_config_ignore_scripts=true
-RUN npm ci --workspace=@btq-swap/frontend --include-workspace-root
-
-# Same-origin API + WebSocket via nginx reverse proxy
-ENV VITE_API_URL=/api
-ENV VITE_WS_URL=
-
-RUN npm run build -w packages/frontend
-
-FROM nginx:alpine
-COPY --from=builder /app/packages/frontend/dist /usr/share/nginx/html
+FROM nginx:1.27-alpine
+COPY --from=build /app/packages/frontend/dist /usr/share/nginx/html
+COPY --from=build /app/packages/htlc/dist/btq-htlc.mjs /usr/share/nginx/html/downloads/btq-htlc.mjs
 COPY packages/frontend/nginx.conf /etc/nginx/conf.d/default.conf
 EXPOSE 80
-CMD ["nginx", "-g", "daemon off;"]
