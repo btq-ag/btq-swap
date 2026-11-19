@@ -16,7 +16,8 @@ import { bytesToHex, decodeBlob, equalBytes, hexToBytes, toBase64 } from './byte
 import { decodeSegwitAddress, type BtqNetwork } from './address.js';
 import { buildClaimTx, buildRefundTx, fromRecord, type HtlcRecord } from './htlc.js';
 import { hashPreimage, linkChallengeMessage, newPreimage, newSeed, signerFromSeed, type DilithiumSigner } from './keys.js';
-import { BtqRpc } from './rpc.js';
+import { BtqRpc, btqToSats } from './rpc.js';
+import { claimRefusal, DEFAULT_CLAIM_MARGIN_BLOCKS, DEFAULT_MIN_CONFIRMATIONS } from './guards.js';
 import { erc20Contract, htlcContract, readInstance } from './evm.js';
 
 export const CLI_VERSION = '1.0.0';
@@ -27,6 +28,8 @@ export interface SwapDescriptor {
     htlc: HtlcRecord | null;
     lock: { txid: string; vout: number; valueSats: string; confirmations: number } | null;
     tipHeight: number;
+    /** Server's BTQ_MIN_CONFIRMATIONS (absent on older servers). */
+    minConfirmations?: number;
   };
   evm: {
     chainId: number;
@@ -147,6 +150,22 @@ async function cmdClaimOrRefund(kind: 'claim' | 'refund', args: Args): Promise<v
     if (!equalBytes(signer.publicKey, htlc.claimPubkey)) throw new Error('this HTLC is not claimable by your key (you are not the buyer)');
     const preimage = findSecretByHash(home, bytesToHex(htlc.secretHash));
     if (!preimage) throw new Error(`no local secret matches hash ${bytesToHex(htlc.secretHash)} — did you run "btq-htlc secret new" on this machine?`);
+    const minConfirmations = Math.max(Number(flag(args, 'min-confirmations') ?? 0), d.btq.minConfirmations ?? DEFAULT_MIN_CONFIRMATIONS);
+    const marginBlocks = Number(flag(args, 'claim-margin-blocks') ?? DEFAULT_CLAIM_MARGIN_BLOCKS);
+    let lockConfirmations = d.btq.lock.confirmations;
+    let tipHeight = d.btq.tipHeight;
+    const node = rpcFrom(args);
+    if (node) {
+      // Trust your own node over the server: the output must exist unspent, at the HTLC script, with the agreed value.
+      const out = await node.call<{ confirmations: number; value: number; scriptPubKey: { hex: string } } | null>('gettxout', [outpoint.txid, outpoint.vout, false]);
+      if (!out) throw new Error(`your node has no unspent confirmed output ${outpoint.txid}:${outpoint.vout}; do not claim`);
+      if (out.scriptPubKey.hex.toLowerCase() !== bytesToHex(htlc.scriptPubKey)) throw new Error('the lock output does not pay the HTLC script; do not claim');
+      if (btqToSats(out.value.toFixed(8)) !== outpoint.valueSats) throw new Error(`the lock output holds ${out.value} BTQ, not ${outpoint.valueSats} sats; do not claim`);
+      lockConfirmations = out.confirmations;
+      tipHeight = await node.call<number>('getblockcount');
+    }
+    const refusal = claimRefusal({ lockConfirmations, minConfirmations, tipHeight, refundLocktime: htlc.refundLocktime, marginBlocks });
+    if (refusal) throw new Error(`refusing to claim: ${refusal}`);
     signed = buildClaimTx({ htlc, outpoint, destination: to, preimage, signer, feeRateSatVb: feeRate });
   } else {
     if (!equalBytes(signer.publicKey, htlc.refundPubkey)) throw new Error('this HTLC is not refundable by your key (you are not the seller)');

@@ -21,6 +21,11 @@ export function cliUrl(): string {
   return `${config().PUBLIC_BASE_URL.replace(/\/+$/, '')}/downloads/btq-htlc.mjs`;
 }
 
+/** The trade desk: the only place Solana locks, withdrawals and refunds are signed (the CLI has no Solana commands). */
+export function deskUrl(): string {
+  return `${config().PUBLIC_BASE_URL.replace(/\/+$/, '')}/`;
+}
+
 function evmRpc(): string {
   return config().PUBLIC_EVM_RPC_URL ?? config().EVM_RPC_URL;
 }
@@ -52,9 +57,24 @@ export function instructionFor(swap: SwapRow, role: Role, tipHeight?: number): I
   const btq = `${swap.amount_btq} BTQ`;
   const usdt = `${usdtDisplay(swap)} USDT`;
   const wait = (headline: string, deadline: Date | null = null): Instruction => ({ role, actionable: false, headline, detail: STATUS_LABEL[swap.status], commands: [], deadline });
+  const sol = swap.settlement_rail === 'solana';
+  const onDesk = (wallet: string | null) => `Open the trade desk and sign with your Solana wallet${wallet ? ` \`${wallet}\`` : ''}: ${deskUrl()}`;
 
   switch (swap.status) {
     case 'awaiting_buyer_lock':
+      if (role === 'buyer' && sol) {
+        return {
+          role,
+          actionable: true,
+          headline: `Lock ${usdt} on Solana for the seller`,
+          detail:
+            `${onDesk(swap.buyer_sol)}\n` +
+            `The desk creates your swap secret in the browser and saves it to a file; only its hash leaves your machine. ` +
+            `Lock before <t:${Math.floor(swap.buyer_lock_by.getTime() / 1000)}:R> or the swap expires.`,
+          commands: [],
+          deadline: swap.buyer_lock_by,
+        };
+      }
       if (role === 'buyer') {
         return {
           role,
@@ -110,6 +130,18 @@ export function instructionFor(swap: SwapRow, role: Role, tipHeight?: number): I
       }
       return wait(`Waiting for the buyer to claim ${btq} (before block ${swap.btq_refund_locktime})`);
     case 'awaiting_seller_claim':
+      if (role === 'seller' && sol) {
+        return {
+          role,
+          actionable: true,
+          headline: `Collect your ${usdt} on Solana`,
+          detail:
+            `The buyer claimed the BTQ and revealed the secret \`${swap.revealed_preimage}\`. ` +
+            `Withdraw before <t:${Math.floor((swap.evm_deadline?.getTime() ?? 0) / 1000)}:R>.\n${onDesk(swap.seller_sol)}`,
+          commands: [],
+          deadline: swap.evm_deadline,
+        };
+      }
       if (role === 'seller') {
         return {
           role,
@@ -129,8 +161,9 @@ export function instructionFor(swap: SwapRow, role: Role, tipHeight?: number): I
           role,
           actionable: true,
           headline: `Refund your ${usdt}`,
-          detail: `The seller did not lock BTQ in time. Your USDT unlocks at <t:${Math.floor((swap.evm_deadline?.getTime() ?? 0) / 1000)}:f>; refund it then.`,
-          commands: [cli(`evm refund --swap ${n} --evm-rpc ${evmRpc()} --key env:EVM_PRIVATE_KEY`)],
+          detail: `The seller did not lock BTQ in time. Your USDT unlocks at <t:${Math.floor((swap.evm_deadline?.getTime() ?? 0) / 1000)}:f>; refund it then.` +
+            (sol ? `\n${onDesk(swap.buyer_sol)}` : ''),
+          commands: sol ? [] : [cli(`evm refund --swap ${n} --evm-rpc ${evmRpc()} --key env:EVM_PRIVATE_KEY`)],
           deadline: swap.evm_deadline,
         };
       }
@@ -151,8 +184,9 @@ export function instructionFor(swap: SwapRow, role: Role, tipHeight?: number): I
           role,
           actionable: true,
           headline: `Refund your ${usdt}`,
-          detail: `The swap timed out. Your USDT unlocks at <t:${Math.floor((swap.evm_deadline?.getTime() ?? 0) / 1000)}:f>.`,
-          commands: [cli(`evm refund --swap ${n} --evm-rpc ${evmRpc()} --key env:EVM_PRIVATE_KEY`)],
+          detail: `The swap timed out. Your USDT unlocks at <t:${Math.floor((swap.evm_deadline?.getTime() ?? 0) / 1000)}:f>.` +
+            (sol ? `\n${onDesk(swap.buyer_sol)}` : ''),
+          commands: sol ? [] : [cli(`evm refund --swap ${n} --evm-rpc ${evmRpc()} --key env:EVM_PRIVATE_KEY`)],
           deadline: swap.evm_deadline,
         };
       }

@@ -62,8 +62,12 @@ export function swapBindingAsset(swapId: string): string {
   return `BTQ swap ${swapId}`;
 }
 
+/** Canonical 8-4-4-4-12 UUID. Anything looser can reach a Postgres uuid cast and throw. */
+export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** `otherAsset` is attacker-controlled on-chain data: return null for anything that is not a canonical swap UUID. */
 export function parseSwapBindingAsset(otherAsset: string): string | null {
-  const m = /^BTQ swap ([0-9a-f-]{36})$/i.exec(otherAsset.trim());
+  const m = /^BTQ swap ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.exec(otherAsset.trim());
   return m ? m[1]!.toLowerCase() : null;
 }
 

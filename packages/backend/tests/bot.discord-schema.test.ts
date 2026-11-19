@@ -20,6 +20,13 @@ vi.mock('../src/domain/book', async (orig) => ({
   publicBook: async () => ({ bids: [], asks: [], topBids: [], topAsks: [], bestBid: '2.450000', bestAsk: '2.550000', paused: false }),
   getOrder: async () => ({ id: 'o', short_id: '12', side: 'sell', price_usdt: '2.550000', amount_btq: '100.00000000', filled_btq: '0', status: 'open' }),
 }));
+vi.mock('../src/domain/settings', async (orig) => ({
+  ...(await orig<typeof import('../src/domain/settings')>()),
+  getSettings: async () => ({
+    book_paused: false, min_order_btq: '0.1', max_order_btq: '1000', mm_max_notional_usdt: '100000',
+    mm_max_order_btq: '500', mm_min_spread_pct: '0.5', settlement_rail: 'evm',
+  }),
+}));
 vi.mock('../src/domain/identity', async (orig) => ({
   ...(await orig<typeof import('../src/domain/identity')>()),
   assertCanTrade: () => undefined,

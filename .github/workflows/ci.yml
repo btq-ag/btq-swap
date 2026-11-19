@@ -28,6 +28,10 @@ jobs:
         run: npm run build -w packages/frontend
       - name: contracts — HtlcERC20 tests
         run: npm test -w packages/contracts
+      - name: contracts — committed backend artifacts match the sources
+        run: |
+          node packages/contracts/scripts/export-artifacts.mjs
+          git diff --exit-code -- packages/backend/src/chains/artifacts
 
   docker:
     runs-on: ubuntu-latest

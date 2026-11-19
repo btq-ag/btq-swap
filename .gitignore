@@ -8,6 +8,8 @@ coverage/
 typechain/
 typechain-types/
 artifacts/
+# The backend imports these ABI + bytecode files; keep them tracked so a clean checkout builds.
+!packages/backend/src/chains/artifacts/
 cache/
 *.tsbuildinfo
 sim-reports/

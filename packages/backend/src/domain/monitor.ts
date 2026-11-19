@@ -211,6 +211,7 @@ export async function cliDescriptor(ref: string) {
       htlc,
       lock: s.btq_lock_txid ? { txid: s.btq_lock_txid, vout: s.btq_lock_vout, valueSats: s.btq_lock_sats, confirmations: s.btq_lock_confs } : null,
       tipHeight: btqStatus.tip,
+      minConfirmations: config().BTQ_MIN_CONFIRMATIONS,
     },
     evm: {
       chainId: s.evm_chain_id,

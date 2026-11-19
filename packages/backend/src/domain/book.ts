@@ -1,3 +1,4 @@
+import { UUID_RE } from '@btq-swap/htlc';
 import { config } from '../config';
 import { evmChain } from '../chains/evm';
 import { db, many, one, tx, type Queryable } from '../lib/db';
@@ -200,7 +201,7 @@ export async function takeOrder(userId: string, orderRef: string, amountBtq: str
 export async function getOrder(ref: string, q: Queryable = db()): Promise<OrderRow | null> {
   const s = ref.trim().replace(/^#/, '');
   if (/^\d+$/.test(s)) return one<OrderRow>(q, 'SELECT * FROM orders WHERE short_id = $1', [s]);
-  if (/^[0-9a-f-]{36}$/i.test(s)) return one<OrderRow>(q, 'SELECT * FROM orders WHERE id = $1', [s]);
+  if (UUID_RE.test(s)) return one<OrderRow>(q, 'SELECT * FROM orders WHERE id = $1', [s]);
   return null;
 }
 

@@ -241,6 +241,17 @@ export async function noteBtqLock(user: UserRow, ref: string, txid: string): Pro
   await hintBtqLock(user.id, ref, txid);
 }
 
+/**
+ * A Solana desk account keeps its first wallet in its synthetic id (web:sol:<address>) for good.
+ * That id may find the account only until a wallet is linked, or while that same wallet is still
+ * the linked one. Once another wallet replaces it, the old address must not sign in.
+ */
+export function solIdFallbackAllowed(user: Pick<UserRow, 'sol_address'>, address: string): boolean {
+  return !user.sol_address || user.sol_address === address;
+}
+
+const SOL_REPLACED = 'That Solana wallet was replaced on its account. Connect the wallet that is linked now.';
+
 async function userForSol(address: string, accepted: boolean): Promise<UserRow> {
   const linked = await one<UserRow>(db(), 'SELECT * FROM users WHERE sol_address = $1', [address]);
   if (linked) {
@@ -260,6 +271,7 @@ async function userForSol(address: string, accepted: boolean): Promise<UserRow> 
     );
     return user!;
   }
+  if (!solIdFallbackAllowed(user, address)) throw new DomainError('FORBIDDEN', SOL_REPLACED);
   if (accepted && !linkStatus(user).tos) return acceptTos(user.id);
   return user;
 }
@@ -284,7 +296,11 @@ export async function beginSol(address: string, accepted: boolean, sessionUser: 
 
 export async function completeSol(address: string, signature: string, sessionUser: UserRow | null): Promise<{ token: string | null; expiresAt: string | null; profile: DeskProfile }> {
   const canonical = new PublicKey(address).toBase58();
-  const user = sessionUser ?? (await one<UserRow>(db(), 'SELECT * FROM users WHERE discord_id = $1 OR sol_address = $2', [`web:sol:${canonical}`, canonical]));
+  let user = sessionUser ?? (await one<UserRow>(db(), 'SELECT * FROM users WHERE sol_address = $1', [canonical]));
+  if (!user) {
+    user = await getUserByDiscordId(`web:sol:${canonical}`);
+    if (user && !solIdFallbackAllowed(user, canonical)) throw new DomainError('FORBIDDEN', SOL_REPLACED);
+  }
   if (!user) throw new DomainError('NOT_REGISTERED', 'Connect the Solana wallet again.');
   const ch = await one<{ message: string; expires_at: Date; consumed_at: Date | null }>(
     db(),

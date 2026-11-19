@@ -17,7 +17,8 @@ export async function solanaTick(): Promise<void> {
     solanaStatus.slot = await connection.getSlot('confirmed');
     solanaStatus.lastTickAt = Date.now();
     solanaStatus.reachable = true;
-    return connection.getProgramAccounts(programId, { commitment: 'confirmed' });
+    // finalized: a lock observed here tells the seller to fund BTQ, so it must not be rolled back.
+    return connection.getProgramAccounts(programId, { commitment: 'finalized' });
   });
   for (const row of accounts) {
     const state = parseSolHtlcState(Buffer.from(row.account.data));

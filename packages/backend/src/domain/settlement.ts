@@ -8,6 +8,7 @@ import {
   newPreimage,
   parseSwapBindingAsset,
   sha256Bytes,
+  UUID_RE,
   type HtlcDescriptor,
 } from '@btq-swap/htlc';
 import { config, sellerTimeBudgetSec } from '../config';
@@ -42,7 +43,7 @@ async function lockSwap(c: Queryable, swapId: string): Promise<SwapRow | null> {
 export async function getSwap(idOrShort: string | number, q: Queryable = db()): Promise<SwapRow | null> {
   const s = String(idOrShort).trim().replace(/^#/, '');
   if (/^\d+$/.test(s)) return one<SwapRow>(q, 'SELECT * FROM swaps WHERE short_id = $1', [s]);
-  if (/^[0-9a-f-]{36}$/i.test(s)) return one<SwapRow>(q, 'SELECT * FROM swaps WHERE id = $1', [s]);
+  if (UUID_RE.test(s)) return one<SwapRow>(q, 'SELECT * FROM swaps WHERE id = $1', [s]);
   return null;
 }
 
@@ -285,7 +286,7 @@ export async function onEvmLockup(ev: LockupObservation, headBlock: number, nowS
   });
 }
 
-export async function observeSolanaAccount(input: {
+export interface SolanaLockObservation {
   partyA: string;
   partyB: string;
   mint: string;
@@ -297,23 +298,52 @@ export async function observeSolanaAccount(input: {
   preimageHex: string;
   agreementHex: string;
   signature: string | null;
-}): Promise<void> {
+}
+
+/**
+ * The Solana escrow address is derived from the locked amount, and every later withdraw or refund
+ * is built from the swap's amount. The amounts must match exactly, or the seller's claim targets
+ * an escrow that does not exist.
+ */
+export function validateSolanaLock(s: Pick<SwapRow, 'amount_usdt_units' | 'secret_hash'>, input: Pick<SolanaLockObservation, 'amount' | 'deadline' | 'secretHashHex'>, nowSec: number): string | null {
+  if (input.amount !== BigInt(s.amount_usdt_units)) return `amount ${input.amount} must equal ${s.amount_usdt_units}`;
+  const remaining = input.deadline - nowSec;
+  const needed = sellerTimeBudgetSec() + 60;
+  if (remaining < needed) return `deadline leaves ${remaining}s, need at least ${needed}s`;
+  if (remaining > config().SWAP_EVM_LOCK_MAX_DURATION_SEC + 120) return `deadline is too far in the future (${remaining}s)`;
+  if (s.secret_hash && s.secret_hash !== input.secretHashHex) return 'secret hash does not match the platform secret';
+  return null;
+}
+
+export async function observeSolanaAccount(input: SolanaLockObservation): Promise<void> {
   const nowSec = Math.floor(Date.now() / 1000);
   await tx(async (c) => {
     const s = await one<SwapRow>(
       c,
       `SELECT * FROM swaps
         WHERE settlement_rail = 'solana' AND buyer_sol = $1 AND seller_sol = $2 AND evm_token = $3
-          AND (evm_agreement_id = $4 OR (evm_agreement_id IS NULL AND status = 'awaiting_buyer_lock' AND amount_usdt_units <= $5))
-        ORDER BY CASE WHEN evm_agreement_id = $4 THEN 0 ELSE 1 END, created_at
+          AND (evm_agreement_id = $4 OR (evm_agreement_id IS NULL AND status = 'awaiting_buyer_lock'))
+        ORDER BY CASE WHEN evm_agreement_id = $4 THEN 0 WHEN amount_usdt_units = $5 THEN 1 ELSE 2 END, created_at
         LIMIT 1 FOR UPDATE`,
       [input.partyA, input.partyB, input.mint, input.agreementHex, input.amount.toString()],
     );
     if (!s || s.evm_agreement_id) return;
     if (s.status !== 'awaiting_buyer_lock' || input.refunded) return;
-    const remaining = input.deadline - nowSec;
-    if (remaining < sellerTimeBudgetSec() + 60 || remaining > config().SWAP_EVM_LOCK_MAX_DURATION_SEC + 120) return;
-    if (s.secret_hash && s.secret_hash !== input.secretHashHex) return;
+    const problem = validateSolanaLock(s, input, nowSec);
+    if (problem) {
+      // The watcher sees this account every tick: record and notify once per agreement.
+      const fresh = await recordEvent(c, s.id, 'solana_lock_rejected', { reason: problem, agreementId: input.agreementHex }, { actionKey: `solana_lock_rejected:${input.agreementHex}` });
+      if (fresh) {
+        await enqueueNotification(c, {
+          userId: s.buyer_user_id,
+          swapId: s.id,
+          kind: 'info',
+          dedupeKey: `rejected_lock:${input.agreementHex}`,
+          payload: { title: `Swap #${s.short_id}: Solana lock rejected`, body: `Reason: ${problem}. Refund that lock after its deadline; you can still lock correctly before the swap window closes.` },
+        });
+      }
+      return;
+    }
     const updated = await transition(c, s.id, ['awaiting_buyer_lock'], 'buyer_lock_confirming', 'solana_locked', {
       secret_hash: input.secretHashHex,
       evm_agreement_id: input.agreementHex,
