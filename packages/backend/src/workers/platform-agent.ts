@@ -1,4 +1,4 @@
-import { buildClaimTx, buildRefundTx, btqNetworkTag, swapBindingAsset } from '@btq-swap/htlc';
+import { buildClaimTx, buildRefundTx, btqNetworkTag, swapBindingAsset, claimRefusal, DEFAULT_CLAIM_MARGIN_BLOCKS, bytesToHex, btqToSats } from '@btq-swap/htlc';
 import { config } from '../config';
 import { btqChain } from '../chains/btq';
 import { evmChain } from '../chains/evm';
@@ -16,6 +16,24 @@ import type { SwapRow } from '../domain/types';
 
 const log = createLogger('platform-agent');
 const MAX_ATTEMPTS = 5;
+class DeferredAction extends Error {}
+
+/** Read our node immediately before authorizing disclosure of the platform's secret. */
+export async function platformClaimRefusal(s: SwapRow): Promise<string | null> {
+  const btq = btqChain();
+  const [output, tip] = await Promise.all([
+    btq.rpc.call<{ bestblock: string; confirmations: number; value: number; scriptPubKey: { hex: string } } | null>(
+      'gettxout', [s.btq_lock_txid, s.btq_lock_vout, true]),
+    btq.tip(),
+  ]);
+  if (!output) return 'the funding output is missing or already spent';
+  if (output.bestblock !== tip.hash) return 'the chain changed while checking funding; retry next tick';
+  const htlc = htlcForSwap(s);
+  if (output.scriptPubKey?.hex?.toLowerCase() !== bytesToHex(htlc.scriptPubKey)) return 'the funding output has the wrong HTLC script';
+  if (!Number.isFinite(output.value) || btqToSats(output.value.toFixed(8)) !== BigInt(s.btq_lock_sats!)) return 'the funding output has the wrong value';
+  return claimRefusal({ lockConfirmations: output.confirmations, minConfirmations: config().BTQ_MIN_CONFIRMATIONS,
+    tipHeight: tip.height, refundLocktime: htlc.refundLocktime, marginBlocks: DEFAULT_CLAIM_MARGIN_BLOCKS });
+}
 
 async function attemptNo(swapId: string, kind: string): Promise<number> {
   const r = await one<{ n: string }>(
@@ -37,6 +55,12 @@ async function once(s: SwapRow, kind: string, fn: () => Promise<Record<string, u
     await recordEvent(db(), s.id, `platform_${kind}`, meta, { actor: 'platform' });
     log.info(`swap #${s.short_id}: ${kind} done`, meta);
   } catch (err) {
+    if (err instanceof DeferredAction) {
+      // No transaction was signed or sent. Release only this attempt's reservation.
+      await db().query(`DELETE FROM swap_events WHERE action_key = $1 AND event_type = 'platform_action'`, [key]);
+      log.info(`swap #${s.short_id}: ${kind} deferred`, { reason: err.message });
+      return;
+    }
     log.error(`swap #${s.short_id}: ${kind} failed`, { err: (err as Error).message, attempt });
     await recordEvent(db(), s.id, 'platform_action_failed', { kind, attempt, error: (err as Error).message }, { actor: 'platform' });
   }
@@ -108,9 +132,22 @@ export async function platformTick(tip: number): Promise<void> {
           return { txid, address: s.btq_htlc_address };
         });
       } else if (isBuyer && s.status === 'awaiting_buyer_claim' && s.btq_lock_txid && !s.btq_claim_txid) {
+        // Waiting for safe evidence is not a broadcast attempt and must not consume the action key.
+        const refusal = await platformClaimRefusal(s);
+        if (refusal) {
+          log.info(`swap #${s.short_id}: BTQ claim deferred`, { reason: refusal });
+          continue;
+        }
+        const dest = await btq.platformAddress('swap-claims');
         await once(s, 'btq_claim', async () => {
+          // Database and wallet RPC work above can cross the refund-height boundary.
+          try {
+            const refusal = await platformClaimRefusal(s);
+            if (refusal) throw new DeferredAction(refusal);
+          } catch (err) {
+            throw new DeferredAction((err as Error).message);
+          }
           const preimage = decryptSecret(s.platform_secret_enc!, config().PLATFORM_SECRET_KEY);
-          const dest = await btq.platformAddress('swap-claims');
           const signed = buildClaimTx({
             htlc: htlcForSwap(s),
             outpoint: { txid: s.btq_lock_txid!, vout: s.btq_lock_vout!, valueSats: BigInt(s.btq_lock_sats!) },
