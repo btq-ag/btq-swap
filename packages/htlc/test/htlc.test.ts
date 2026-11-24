@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   buildClaimTx,
   buildRefundTx,
@@ -79,6 +79,35 @@ describe('addresses', () => {
 describe('claim / refund construction', () => {
   const outpoint = { txid: FUND_TXID, vout: 1, valueSats: 125_000_000n };
   const dest = 'qcrt1qqzy9e9njkp0pw82ym7j8rnsq47wdye783wuarc';
+
+  it.each([-1, NaN, Infinity, -Infinity, Number.MAX_VALUE])('rejects invalid fee rate %s without signing', (feeRateSatVb) => {
+    const sign = vi.fn(buyer.sign);
+    expect(() => buildClaimTx({ htlc: htlc(), outpoint, destination: dest, preimage: secret.preimage,
+      signer: { ...buyer, sign }, feeRateSatVb })).toThrow(/fee/i);
+    expect(sign).not.toHaveBeenCalled();
+    expect(() => buildClaimTx({ htlc: htlc(), outpoint, destination: dest, preimage: secret.preimage,
+      signer: { ...buyer, sign }, feeRateSatVb, feeSats: 0n })).toThrow(/fee/i);
+    expect(sign).not.toHaveBeenCalled();
+    const refundSign = vi.fn(seller.sign);
+    expect(() => buildRefundTx({ htlc: htlc(), outpoint, destination: dest,
+      signer: { ...seller, sign: refundSign }, feeRateSatVb })).toThrow(/fee/i);
+    expect(refundSign).not.toHaveBeenCalled();
+  });
+
+  it('rejects negative absolute fees, including with a valid rate, before signing', () => {
+    const sign = vi.fn(buyer.sign);
+    expect(() => buildClaimTx({ htlc: htlc(), outpoint, destination: dest, preimage: secret.preimage,
+      signer: { ...buyer, sign }, feeSats: -1n, feeRateSatVb: 2 })).toThrow(/non-negative/);
+    expect(sign).not.toHaveBeenCalled();
+    expect(() => buildRefundTx({ htlc: htlc(), outpoint, destination: dest, signer: seller, feeSats: -1n })).toThrow(/non-negative/);
+  });
+
+  it('accepts zero fees and rejects invalid rates even with an absolute fee override', () => {
+    const args = { htlc: htlc(), outpoint, destination: dest, preimage: secret.preimage, signer: buyer };
+    expect(buildClaimTx({ ...args, feeSats: 0n }).outputSats).toBe(outpoint.valueSats);
+    expect(buildClaimTx({ ...args, feeRateSatVb: 0 }).feeSats).toBe(0n);
+    expect(() => buildClaimTx({ ...args, feeSats: 1n, feeRateSatVb: -1 })).toThrow(/non-negative/);
+  });
 
   it('builds a claim with [sig, preimage, leaf, control] and the BTQ vsize', () => {
     const h = htlc();
