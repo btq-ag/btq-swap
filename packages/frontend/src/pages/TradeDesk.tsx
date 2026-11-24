@@ -102,8 +102,8 @@ export function TradeDesk() {
   const holding = yourTurn(plan);
 
   const book = liveBook.data ?? data?.book;
-  const asks = (book?.asks ?? []).map((level, i) => ({ orderNo: i + 1, price: level.price, remainingBtq: level.amountBtq, mm: level.mm, orders: level.orders }));
-  const bids = (book?.bids ?? []).map((level, i) => ({ orderNo: i + 1, price: level.price, remainingBtq: level.amountBtq, mm: level.mm, orders: level.orders }));
+  const asks = book?.topAsks ?? [];
+  const bids = book?.topBids ?? [];
   const fresh = at > 0 && Date.now() - at < 8_000 && !error;
 
   useEffect(() => {
@@ -144,8 +144,8 @@ export function TradeDesk() {
 
   const level = useMemo(() => {
     const rows = side === 'buy' ? asks : bids;
-    return rows.find((r) => price && r.price === price) ?? rows[0] ?? null;
-  }, [asks, bids, orderNo, price, side]);
+    return rows.find((r) => orderNo != null && r.orderNo === orderNo) ?? rows[0] ?? null;
+  }, [asks, bids, orderNo, side]);
 
   const total = useMemo(() => {
     try {

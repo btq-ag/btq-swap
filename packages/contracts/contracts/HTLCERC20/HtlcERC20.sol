@@ -2,7 +2,8 @@
 
 pragma solidity ^0.8.20;
 
-import "@openzeppelin/contracts/interfaces/IERC20.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "../libraries/HtlcERC20Lib.sol";
 
 /**
@@ -18,6 +19,7 @@ import "../libraries/HtlcERC20Lib.sol";
  */
 
 contract HtlcERC20 {
+	using SafeERC20 for IERC20;
 	using HtlcERC20Lib for HtlcERC20Lib.HTLCProposal;
 
 	mapping(bytes32 => HtlcERC20Lib.HTLCProposal) htlcInstances;
@@ -155,11 +157,7 @@ contract HtlcERC20 {
 			revert("Duplicate HTLC already exists");
 		}
 
-		if (
-			!params.erc20Contract.transferFrom(msg.sender, address(this), params.tokenAmount)
-		) {
-			revert("transferFrom from partyA failed");
-		}
+		params.erc20Contract.safeTransferFrom(msg.sender, address(this), params.tokenAmount);
 
 		htlcInstances[agreementId] = HtlcERC20Lib.HTLCProposal(
 			msg.sender,
@@ -215,7 +213,7 @@ contract HtlcERC20 {
 		instance.key = _key;
 
 		instance.tokensWithdrawn = true;
-		IERC20(instance.erc20Contract).transfer(instance.partyB, instance.tokenAmount);
+		instance.erc20Contract.safeTransfer(instance.partyB, instance.tokenAmount);
 		emit HtlcERC20Lib.HTLCERC20Claimed(_htlcInstanceId);
 		return true;
 	}
@@ -237,7 +235,7 @@ contract HtlcERC20 {
 	{
 		HtlcERC20Lib.HTLCProposal storage instance = htlcInstances[_htlcInstanceId];
 		instance.tokensRefunded = true;
-		IERC20(instance.erc20Contract).transfer(instance.partyA, instance.tokenAmount);
+		instance.erc20Contract.safeTransfer(instance.partyA, instance.tokenAmount);
 		emit HtlcERC20Lib.HTLCERC20Redeemed(_htlcInstanceId);
 		return true;
 	}
