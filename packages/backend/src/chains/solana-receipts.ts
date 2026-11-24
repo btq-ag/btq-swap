@@ -38,4 +38,3 @@ export function solanaReceiptActions(r:VersionedTransactionResponse,e:SolanaEscr
   }
   return actions;
 }
-
