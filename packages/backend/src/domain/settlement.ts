@@ -10,12 +10,14 @@ import {
   sha256Bytes,
   UUID_RE,
   type HtlcDescriptor,
+  toRecord,
 } from '@btq-swap/htlc';
 import { config, sellerTimeBudgetSec } from '../config';
 import { encryptSecret } from '../lib/crypto';
 import { db, many, one, tx, type Queryable } from '../lib/db';
 import { createLogger } from '../lib/logger';
 import { DomainError } from './errors';
+import { hashOwnerConflict, rememberLock } from './funding';
 import { getSettings } from './settings';
 import { instructionFor, usdtDisplay } from './instructions';
 import { fromUnits, usdtUnitsFor } from './money';
@@ -244,32 +246,22 @@ export async function onEvmLockup(ev: LockupObservation, headBlock: number, nowS
   await tx(async (c) => {
     const s = await lockSwap(c, swapId);
     if (!s) return;
-    if (s.evm_agreement_id) {
-      if (s.evm_agreement_id !== ev.agreementId.toLowerCase()) {
-        await recordEvent(c, s.id, 'evm_lock_ignored', { reason: 'swap already has a lock', agreementId: ev.agreementId, txHash: ev.txHash });
-      }
-      return;
-    }
-    if (s.status !== 'awaiting_buyer_lock') {
-      await recordEvent(c, s.id, 'evm_lock_ignored', { reason: `swap is ${s.status}`, agreementId: ev.agreementId, txHash: ev.txHash });
-      await enqueueNotification(c, {
-        userId: s.buyer_user_id,
-        swapId: s.id,
-        kind: 'info',
-        dedupeKey: `late_lock:${ev.agreementId}`,
-        payload: { title: `Swap #${s.short_id}: lock not accepted`, body: `Your USDT lock arrived while the swap was ${STATUS_LABEL[s.status]}. Refund it after its deadline with \`btq-htlc evm refund\`.` },
-      });
-      return;
-    }
-    const problem = validateLockup(s, ev, nowSec);
+    if (s.settlement_rail !== 'evm') return;
+    if (s.evm_agreement_id === ev.agreementId.toLowerCase()) return;
+    let problem = s.evm_agreement_id ? 'swap already has a lock' :
+      s.status !== 'awaiting_buyer_lock' ? `swap is ${s.status}` : validateLockup(s, ev, nowSec);
+    // An underpaid/rejected escrow can still disclose its preimage. Never reuse its hash for a new lock.
+    // Only the bound buyer can reserve this swap's hash; an outsider's mislabeled transfer cannot claim it.
+    if (ev.partyA.toLowerCase() === s.buyer_eth.toLowerCase() && await hashOwnerConflict(c, ev.secretlock.slice(2), s, ev.agreementId)) problem = 'secret hash was already used by another lock';
+    // Keep the typed recovery fields; arbitrary on-chain labels can contain text PostgreSQL rejects.
+    await rememberLock(c, s, 'evm', ev.agreementId, { agreementId: ev.agreementId, txHash: ev.txHash,
+      blockNumber: ev.blockNumber, partyA: ev.partyA, partyB: ev.partyB, erc20Contract: ev.erc20Contract,
+      secretHash: ev.secretlock, deadline: ev.deadline, tokenAmount: ev.tokenAmount.toString() }, problem);
     if (problem) {
-      await recordEvent(c, s.id, 'evm_lock_rejected', { reason: problem, agreementId: ev.agreementId, txHash: ev.txHash });
-      await enqueueNotification(c, {
-        userId: s.buyer_user_id,
-        swapId: s.id,
-        kind: 'info',
-        dedupeKey: `rejected_lock:${ev.agreementId}`,
-        payload: { title: `Swap #${s.short_id}: USDT lock rejected`, body: `Reason: ${problem}. Refund that lock after its deadline; you can still lock correctly before the swap window closes.` },
+      const fresh = await recordEvent(c, s.id, 'evm_lock_rejected', { reason: problem, agreementId: ev.agreementId, txHash: ev.txHash }, { actionKey: `rejected_evm:${s.id}:${ev.agreementId}` });
+      if (fresh) await enqueueNotification(c, {
+        userId: s.buyer_user_id, swapId: s.id, kind: 'info', dedupeKey: `rejected_lock:${ev.agreementId}`,
+        payload: { title: `Swap #${s.short_id}: USDT lock rejected`, body: `Reason: ${problem}. Refund after its deadline with \`btq-htlc evm refund --swap ${s.short_id} --agreement-id ${ev.agreementId}\`.` },
       });
       return;
     }
@@ -329,7 +321,8 @@ export async function observeSolanaAccount(input: SolanaLockObservation): Promis
     );
     if (!s || s.evm_agreement_id) return;
     if (s.status !== 'awaiting_buyer_lock' || input.refunded) return;
-    const problem = validateSolanaLock(s, input, nowSec);
+    let problem = validateSolanaLock(s, input, nowSec);
+    if (await hashOwnerConflict(c, input.secretHashHex, s, input.agreementHex)) problem = 'secret hash was already used by another lock';
     if (problem) {
       // The watcher sees this account every tick: record and notify once per agreement.
       const fresh = await recordEvent(c, s.id, 'solana_lock_rejected', { reason: problem, agreementId: input.agreementHex }, { actionKey: `solana_lock_rejected:${input.agreementHex}` });
@@ -450,25 +443,22 @@ export async function onBtqLockOutput(swapId: string, o: { txid: string; vout: n
   await tx(async (c) => {
     const s = await lockSwap(c, swapId);
     if (!s) return;
-    if (s.btq_lock_txid) {
-      if (s.btq_lock_txid === o.txid && s.btq_lock_vout === o.vout && o.height && !s.btq_lock_height) {
-        await patch(c, s.id, { btq_lock_height: o.height });
-      }
+    if (s.btq_lock_txid === o.txid && s.btq_lock_vout === o.vout) {
+      if (o.height && !s.btq_lock_height) await patch(c, s.id, { btq_lock_height: o.height });
       return;
     }
-    if (s.status !== 'awaiting_seller_lock') {
-      await recordEvent(c, s.id, 'btq_lock_ignored', { reason: `swap is ${s.status}`, txid: o.txid, vout: o.vout });
-      await enqueueNotification(c, {
-        userId: s.seller_user_id,
-        swapId: s.id,
-        kind: 'info',
-        dedupeKey: `late_btq:${o.txid}:${o.vout}`,
-        payload: { title: `Swap #${s.short_id}: BTQ lock not accepted`, body: `Your BTQ arrived while the swap was ${STATUS_LABEL[s.status]}. Refund it after block ${s.btq_refund_locktime} with \`btq-htlc refund\`.` },
+    let problem = s.btq_lock_txid ? 'swap already has a BTQ lock' : s.status !== 'awaiting_seller_lock' ? `swap is ${s.status}` :
+      o.sats < BigInt(s.amount_sats) ? `amount ${o.sats} < ${s.amount_sats}` : null;
+    const owned = await rememberLock(c, s, 'btq', `${o.txid}:${o.vout}`, {
+      txid: o.txid, vout: o.vout, valueSats: o.sats.toString(), htlc: toRecord(htlcForSwap(s)),
+    }, problem);
+    if (!owned) problem = 'funding output belongs to another swap';
+    if (problem) {
+      const fresh = await recordEvent(c, s.id, 'btq_lock_rejected', { reason: problem, txid: o.txid, vout: o.vout }, { actionKey: `rejected_btq:${s.id}:${o.txid}:${o.vout}` });
+      if (fresh && owned) await enqueueNotification(c, {
+        userId: s.seller_user_id, swapId: s.id, kind: 'info', dedupeKey: `rejected_btq:${o.txid}:${o.vout}`,
+        payload: { title: `Swap #${s.short_id}: BTQ lock not accepted`, body: `Reason: ${problem}. Refund after block ${s.btq_refund_locktime} with \`btq-htlc refund --swap ${s.short_id} --outpoint ${o.txid}:${o.vout} --rpc <your-node>\`.` },
       });
-      return;
-    }
-    if (o.sats < BigInt(s.amount_sats)) {
-      await recordEvent(c, s.id, 'btq_lock_rejected', { reason: `amount ${o.sats} < ${s.amount_sats}`, txid: o.txid, vout: o.vout });
       return;
     }
     const confs = o.height ? tip - o.height + 1 : 0;

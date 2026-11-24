@@ -19,14 +19,12 @@ interface Watch {
 async function loadWatch(): Promise<Watch> {
   const rows = await many<SwapRow>(
     db(),
-    `SELECT * FROM swaps WHERE
-       (status IN ('awaiting_seller_lock','seller_lock_confirming','awaiting_buyer_refund','expired') AND btq_htlc_spk IS NOT NULL AND btq_lock_txid IS NULL AND updated_at > now() - interval '2 days')
-    OR (btq_lock_txid IS NOT NULL AND btq_claim_txid IS NULL AND btq_refund_txid IS NULL)`,
+    `SELECT * FROM swaps WHERE btq_htlc_spk IS NOT NULL`,
   );
   const w: Watch = { bySpk: new Map(), byOutpoint: new Map() };
   for (const s of rows) {
-    if (s.btq_htlc_spk && !s.btq_lock_txid) w.bySpk.set(s.btq_htlc_spk, s);
-    if (s.btq_lock_txid && s.btq_lock_vout !== null) w.byOutpoint.set(`${s.btq_lock_txid}:${s.btq_lock_vout}`, s);
+    if (s.btq_htlc_spk) w.bySpk.set(s.btq_htlc_spk, s);
+    if (s.btq_lock_txid && s.btq_lock_vout !== null && !s.btq_claim_txid && !s.btq_refund_txid) w.byOutpoint.set(`${s.btq_lock_txid}:${s.btq_lock_vout}`, s);
   }
   return w;
 }
@@ -135,7 +133,7 @@ export async function processLockHints(): Promise<void> {
   const hints = await many<{ swap_id: string; txid: string }>(
     db(),
     `SELECT e.swap_id, e.metadata->>'txid' AS txid FROM swap_events e JOIN swaps s ON s.id = e.swap_id
-      WHERE e.event_type = 'btq_lock_hint' AND s.status = 'awaiting_seller_lock' AND e.created_at > now() - interval '1 hour'`,
+      WHERE e.event_type = 'btq_lock_hint' AND s.btq_htlc_spk IS NOT NULL AND e.created_at > now() - interval '1 hour'`,
   );
   if (!hints.length) return;
   const chain = btqChain();
