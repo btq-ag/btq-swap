@@ -36,9 +36,10 @@ async function main(): Promise<void> {
   let u = await ensureUser(alice.discordId, alice.name, { simulated: true });
   u = await acceptTos(u.id);
   const evmLink = await startEvmLink(u, alice.evmAddress);
-  u = await finishEvmLink(u, await new Wallet(alice.evmKey).signMessage(evmLink.message));
+  u = await finishEvmLink(u, await new Wallet(alice.evmKey).signMessage(evmLink.message), evmLink.challengeId);
   const btqLink = await startBtqLink(u);
   u = await finishBtqLink(u, {
+    challengeId: btqLink.challengeId,
     pubkey: toBase64(alice.htlc.publicKey),
     signature: toBase64(alice.htlc.sign(linkChallengeMessage(btqLink.challenge))),
     btqAddress: alice.btqAddress!,

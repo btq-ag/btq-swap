@@ -113,7 +113,7 @@ export async function connectWallet(id: string): Promise<DeskProfile> {
     const address = await connectMetaMask();
     const started = await deskApi.evmStart(address);
     const signature = await signMessage(address, started.message);
-    const done = await deskApi.evmFinish(address, signature);
+    const done = await deskApi.evmFinish(address, signature, started.challengeId);
     saveDeskToken(done.token);
     return done.profile;
   }
@@ -122,7 +122,7 @@ export async function connectWallet(id: string): Promise<DeskProfile> {
   const address = connected.publicKey.toBase58();
   const started = await deskApi.solStart(address);
   const signed = await wallet.provider.signMessage(new TextEncoder().encode(started.message), 'utf8');
-  const done = await deskApi.solFinish(address, bytesToBase64(signed.signature));
+  const done = await deskApi.solFinish(address, bytesToBase64(signed.signature), started.challengeId);
   if (done.token) saveDeskToken(done.token);
   return done.profile;
 }

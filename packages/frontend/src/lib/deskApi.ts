@@ -1,4 +1,4 @@
-import { getJson } from '../api';
+import { ApiError, getJson } from '../api';
 import type { BtqProof } from './btqWallet';
 import type { EvmLock } from './htlcTx';
 
@@ -60,20 +60,26 @@ function post<T>(path: string, body: unknown, auth = false): Promise<T> {
     method: 'POST',
     headers: { 'content-type': 'application/json', ...(auth ? authHeaders() : {}) },
     body: JSON.stringify(body),
+  }).catch((error: unknown) => {
+    if (auth && error instanceof ApiError && error.status === 401) clearDeskToken();
+    throw error;
   });
 }
 
 export const deskApi = {
-  evmStart: (address: string) => post<{ message: string; expiresAt: string; profile: DeskProfile }>('/public/desk/evm/start', { address, acceptTos: true }),
-  evmFinish: (address: string, signature: string) => post<{ token: string; expiresAt: string; profile: DeskProfile }>('/public/desk/evm/finish', { address, signature }),
-  me: () => getJson<{ profile: DeskProfile }>('/public/desk/me', { headers: authHeaders() }),
-  btqStart: () => post<{ challenge: string; expiresAt: string }>('/public/desk/btq/start', {}, true),
-  btqFinish: (proof: BtqProof) => post<{ profile: DeskProfile }>('/public/desk/btq/finish', proof, true),
+  evmStart: (address: string) => post<{ challengeId: string; message: string; expiresAt: string; profile: DeskProfile }>('/public/desk/evm/start', { address, acceptTos: true }, true),
+  evmFinish: (address: string, signature: string, challengeId: string) => post<{ token: string; expiresAt: string; profile: DeskProfile }>('/public/desk/evm/finish', { address, signature, challengeId }, true),
+  me: () => getJson<{ profile: DeskProfile }>('/public/desk/me', { headers: authHeaders() }).catch((error: unknown) => {
+    if (error instanceof ApiError && error.status === 401) clearDeskToken();
+    throw error;
+  }),
+  btqStart: () => post<{ challengeId: string; challenge: string; expiresAt: string }>('/public/desk/btq/start', {}, true),
+  btqFinish: (proof: BtqProof, challengeId: string) => post<{ profile: DeskProfile }>('/public/desk/btq/finish', { ...proof, challengeId }, true),
   take: (orderNo: number, amountBtq: string) => post<TakenSwap>('/public/desk/take', { orderNo, amountBtq }, true),
   plan: (ref: number | string) => getJson<LockPlan>(`/public/desk/swaps/${ref}/plan`, { headers: authHeaders() }),
   btqLock: (ref: number | string, txid: string) => post<{ ok: boolean }>(`/public/desk/swaps/${ref}/btq-lock`, { txid }, true),
-  solStart: (address: string) => post<{ message: string; profile: DeskProfile }>('/public/desk/sol/start', { address, acceptTos: true }, !!deskToken()),
-  solFinish: (address: string, signature: string) => post<{ token?: string; profile: DeskProfile }>('/public/desk/sol/finish', { address, signature }, !!deskToken()),
+  solStart: (address: string) => post<{ challengeId: string; message: string; profile: DeskProfile }>('/public/desk/sol/start', { address, acceptTos: true }, !!deskToken()),
+  solFinish: (address: string, signature: string, challengeId: string) => post<{ token?: string; profile: DeskProfile }>('/public/desk/sol/finish', { address, signature, challengeId }, !!deskToken()),
   solPrepare: (ref: number | string, action: 'lock' | 'withdraw' | 'refund', secretHash?: string) =>
     post<{ tx: string }>(`/public/desk/swaps/${ref}/sol/prepare`, { action, secretHash }, true),
   solSubmit: (ref: number | string, signedTx: string) => post<{ signature: string }>(`/public/desk/swaps/${ref}/sol/submit`, { signedTx }, true),

@@ -122,7 +122,7 @@ const proofSchema = z.object({
 publicRoutes.post('/public/desk/evm/start', deskLimit, async (req, res, next) => {
   try {
     const body = z.object({ address: z.string(), acceptTos: z.literal(true) }).parse(req.body);
-    res.json(await beginEvm(body.address, true));
+    res.json(await beginEvm(body.address, true, await optionalDeskUser(req.header('authorization'))));
   } catch (err) {
     next(err);
   }
@@ -130,19 +130,16 @@ publicRoutes.post('/public/desk/evm/start', deskLimit, async (req, res, next) =>
 
 publicRoutes.post('/public/desk/evm/finish', deskLimit, async (req, res, next) => {
   try {
-    const body = z.object({ address: z.string(), signature: z.string() }).parse(req.body);
-    res.json(await completeEvm(body.address, body.signature));
+    const body = z.object({ address: z.string(), signature: z.string(), challengeId: z.string().uuid() }).parse(req.body);
+    res.json(await completeEvm(body.address, body.signature, body.challengeId, await optionalDeskUser(req.header('authorization'))));
   } catch (err) {
     next(err);
   }
 });
 
 async function optionalDeskUser(header: string | undefined) {
-  try {
-    return await userFromToken(bearer(header));
-  } catch {
-    return null;
-  }
+  if (header === undefined) return null;
+  return userFromToken(bearer(header));
 }
 
 publicRoutes.post('/public/desk/sol/start', deskLimit, async (req, res, next) => {
@@ -156,9 +153,9 @@ publicRoutes.post('/public/desk/sol/start', deskLimit, async (req, res, next) =>
 
 publicRoutes.post('/public/desk/sol/finish', deskLimit, async (req, res, next) => {
   try {
-    const body = z.object({ address: z.string(), signature: z.string() }).parse(req.body);
+    const body = z.object({ address: z.string(), signature: z.string(), challengeId: z.string().uuid() }).parse(req.body);
     const session = await optionalDeskUser(req.header('authorization'));
-    const done = await completeSol(body.address, body.signature, session);
+    const done = await completeSol(body.address, body.signature, session, body.challengeId);
     if (done.token) res.json(done);
     else res.json({ profile: done.profile });
   } catch (err) {
@@ -207,8 +204,8 @@ publicRoutes.post('/public/desk/btq/start', deskLimit, async (req, res, next) =>
 publicRoutes.post('/public/desk/btq/finish', deskLimit, async (req, res, next) => {
   try {
     const user = await userFromToken(bearer(req.header('authorization')));
-    const proof = proofSchema.parse(req.body) as WalletProof;
-    res.json({ profile: await completeBtq(user, proof, req.header('origin') ?? '') });
+    const { challengeId, ...proof } = proofSchema.extend({ challengeId: z.string().uuid() }).parse(req.body);
+    res.json({ profile: await completeBtq(user, proof as WalletProof, req.header('origin') ?? '', challengeId) });
   } catch (err) {
     next(err);
   }

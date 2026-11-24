@@ -163,11 +163,11 @@ export function TradeDesk() {
     setBusy('BTQ wallet');
     try {
       await connectBtq();
-      const { challenge } = await deskApi.btqStart();
+      const { challenge, challengeId } = await deskApi.btqStart();
       const btq = btqProvider();
       if (!btq) throw new Error('The BTQ wallet extension is not installed in this browser.');
       const proof = await btq.signMessage({ message: challenge });
-      const done = await deskApi.btqFinish(proof);
+      const done = await deskApi.btqFinish(proof, challengeId);
       setProfile(done.profile);
       setNotice(`BTQ wallet ${shortAddr(done.profile.btq)} is linked.`);
     } catch (err) {
