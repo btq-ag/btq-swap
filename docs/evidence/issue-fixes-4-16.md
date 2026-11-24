@@ -39,7 +39,7 @@ Final local runs passed with Node 24.20.0 and an isolated PostgreSQL test databa
 | Exported Solidity artifacts versus committed backend artifacts | No differences |
 | `git diff --check` | Passed |
 
-The local-validator exercise prefunds both the state PDA and its ATA, donates extra tokens, and checks exact token/rent conservation and account closure for withdrawal and refund. The native runtime cases also cover zero preimages, deadline boundaries, incorrect parties/vaults/secrets, occupied state accounts, and the five-account version 1 withdrawal interface.
+The local-validator exercise prefunds both the state PDA and its ATA, donates extra tokens, checks exact token/rent conservation for withdrawal, and verifies account closure for both withdrawal and refund. Native runtime tests check refund token/rent conservation as well as zero preimages, deadline boundaries, incorrect parties/vaults/secrets, occupied state accounts, and the five-account version 1 withdrawal interface.
 
 Reproduction commands, with dedicated test nodes and `TEST_DATABASE_URL` supplied by the operator:
 
