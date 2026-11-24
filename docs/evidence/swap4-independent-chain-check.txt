@@ -1,0 +1,7 @@
+swap #4 completed | BTQ lock 5f3a0aadaf4dc53756d8424e733c9b538581a1944f4a0ca5f5e797516f16c68b | agreement 0x748c361fc7794811497fba14365f05c27f343073af82868c00dbe086788bd05f
+== BTQ chain (btqd, independent of the swap DB):
+claim tx 443b84c839997dac confs 88 | witness sizes [2421, 32, 1355, 33] | witness[1] (preimage) = a9d41b06e812e2ab299e44047d6b2d11dcf122d055a506f4b00985323b457230
+revealed preimage in DB/API  = a9d41b06e812e2ab299e44047d6b2d11dcf122d055a506f4b00985323b457230
+== EVM chain (anvil via public whitelisted RPC):
+withdraw tx 0x9f9b92bbc5bb8590 status 0x1 block 197 | HTLCERC20Claimed topic0 0x5a833a91bcdfa6eb
+Unable to find image 'alpine:latest' locally
