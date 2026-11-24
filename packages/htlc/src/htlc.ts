@@ -144,6 +144,13 @@ function buildSpend(args: {
   feeSats?: bigint;
   locktime?: number;
 }): SignedSpend {
+  // Reject invalid fees before constructing a signature that could reveal a claim secret.
+  if (args.feeSats !== undefined && (typeof args.feeSats !== 'bigint' || args.feeSats < 0n)) {
+    throw new Error('feeSats must be a non-negative bigint');
+  }
+  if (args.feeRateSatVb !== undefined && (!Number.isFinite(args.feeRateSatVb) || args.feeRateSatVb < 0)) {
+    throw new Error('feeRateSatVb must be finite and non-negative');
+  }
   const { kind, htlc, outpoint, signer } = args;
   const expectedPk = kind === 'claim' ? htlc.claimPubkey : htlc.refundPubkey;
   if (!equalBytes(signer.publicKey, expectedPk)) {
@@ -173,6 +180,9 @@ function buildSpend(args: {
     locktime,
   };
   const size = vsize(tx);
+  if (!Number.isSafeInteger(Math.ceil(size * (args.feeRateSatVb ?? DEFAULT_FEE_RATE_SAT_VB)))) {
+    throw new Error('calculated fee exceeds the safe integer range');
+  }
   const fee = args.feeSats ?? BigInt(Math.ceil(size * (args.feeRateSatVb ?? DEFAULT_FEE_RATE_SAT_VB)));
   const outValue = outpoint.valueSats - fee;
   if (outValue < 330n) throw new Error(`HTLC value ${outpoint.valueSats} sats is too small to cover fee ${fee}`);

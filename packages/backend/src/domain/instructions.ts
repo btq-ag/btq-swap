@@ -130,13 +130,14 @@ export function instructionFor(swap: SwapRow, role: Role, tipHeight?: number): I
       }
       return wait(`Waiting for the buyer to claim ${btq} (before block ${swap.btq_refund_locktime})`);
     case 'awaiting_seller_claim':
+      if (role === 'seller' && swap.evm_claim_tx) return wait(`Your ${usdt} claim is confirmed. Waiting for the BTQ claim to confirm.`);
       if (role === 'seller' && sol) {
         return {
           role,
           actionable: true,
           headline: `Collect your ${usdt} on Solana`,
           detail:
-            `The buyer claimed the BTQ and revealed the secret \`${swap.revealed_preimage}\`. ` +
+            `The secret \`${swap.revealed_preimage}\` is public. ` +
             `Withdraw before <t:${Math.floor((swap.evm_deadline?.getTime() ?? 0) / 1000)}:R>.\n${onDesk(swap.seller_sol)}`,
           commands: [],
           deadline: swap.evm_deadline,
@@ -148,13 +149,20 @@ export function instructionFor(swap: SwapRow, role: Role, tipHeight?: number): I
           actionable: true,
           headline: `Collect your ${usdt}`,
           detail:
-            `The buyer claimed the BTQ and revealed the secret \`${swap.revealed_preimage}\`. ` +
+            `The secret \`${swap.revealed_preimage}\` is public. ` +
             `Withdraw the USDT before <t:${Math.floor((swap.evm_deadline?.getTime() ?? 0) / 1000)}:R>.`,
           commands: [cli(`evm claim --swap ${n} --evm-rpc ${evmRpc()} --key env:EVM_PRIVATE_KEY`)],
           deadline: swap.evm_deadline,
         };
       }
-      return wait(`You received ${btq}. The seller is collecting the USDT.`);
+      if (swap.btq_claim_txid) return wait(`Your ${btq} claim is confirmed. The seller is collecting the USDT.`);
+      return {
+        role, actionable: !!swap.btq_lock_txid,
+        headline: 'Your BTQ claim is not yet confirmed',
+        detail: `Your secret is public, so the seller can collect the USDT. Check your BTQ transaction and retry the claim if it was dropped. The claim tool verifies current funding and the refund deadline.`,
+        commands: swap.btq_lock_txid ? [cli(`claim --swap ${n} --to ${swap.buyer_btq_address ?? '<your BTQ address>'} --broadcast`)] : [],
+        deadline: null,
+      };
     case 'awaiting_buyer_refund':
       if (role === 'buyer') {
         return {

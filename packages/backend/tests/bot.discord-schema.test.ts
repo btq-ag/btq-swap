@@ -30,11 +30,14 @@ vi.mock('../src/domain/settings', async (orig) => ({
 vi.mock('../src/domain/identity', async (orig) => ({
   ...(await orig<typeof import('../src/domain/identity')>()),
   assertCanTrade: () => undefined,
-  startBtqLink: async () => ({ challenge: 'btq-swap:123456789012345678:abcdef0123456789abcd', expiresAt: new Date() }),
-  startEvmLink: async () => ({ message: 'x'.repeat(400), address: '0x' + '1'.repeat(40), expiresAt: new Date() }),
+  startBtqLink: async () => ({ challengeId: '11c54482-4cad-405d-b89c-0d553f79d002', challenge: 'btq-swap:123456789012345678:abcdef0123456789abcd', expiresAt: new Date() }),
+  startEvmLink: async () => ({ challengeId: '11c54482-4cad-405d-b89c-0d553f79d002', message: 'x'.repeat(400), address: '0x' + '1'.repeat(40), expiresAt: new Date() }),
+  finishEvmLink: vi.fn(async () => ({ eth_address: '0x' + '1'.repeat(40) })),
+  finishBtqLink: vi.fn(async () => ({ btq_address: 'qcrt1example' })),
 }));
 
 import * as h from '../src/bot/handlers';
+import { finishEvmLink, finishBtqLink } from '../src/domain/identity';
 import type { ModalPayload, ReplyPayload, Responder } from '../src/bot/types';
 
 function capture() {
@@ -89,6 +92,19 @@ function validate(out: { modals: ModalPayload[]; replies: ReplyPayload[] }) {
 }
 
 describe('Discord payload limits', () => {
+  it.each(['evm', 'btq'])('carries the %s challenge through button, modal and completion', async kind => {
+    const { out, r } = capture();
+    await (kind === 'evm' ? h.evmAddressSubmitted : h.linkBtq)(i, ctx, r);
+    const buttonId = out.replies[0]!.components![0]!.components[0]!.custom_id!;
+    const challenge = buttonId.split(':').slice(3);
+    expect(challenge).toEqual(['11c54482-4cad-405d-b89c-0d553f79d002']);
+    await (kind === 'evm' ? h.evmSigButton : h.btqKeyButton)(i, ctx, r, challenge);
+    const modalArgs = out.modals[0]!.custom_id.split(':').slice(3);
+    await (kind === 'evm' ? h.evmSigSubmitted : h.btqKeySubmitted)(i, ctx, r, modalArgs);
+    if (kind === 'evm') expect(finishEvmLink).toHaveBeenCalledWith(ctx.actor.user, '', challenge[0]);
+    else expect(finishBtqLink).toHaveBeenCalledWith(ctx.actor.user, expect.objectContaining({ challengeId: challenge[0] }));
+    validate(out);
+  });
   it.each([
     ['link-evm', h.linkEvm], ['evm-sig button', h.evmSigButton], ['btq-key button', h.btqKeyButton],
     ['buy form', (a: never, b: never, c: Responder) => h.orderForm(a, b, c, 'buy')], ['sell form', (a: never, b: never, c: Responder) => h.orderForm(a, b, c, 'sell')],

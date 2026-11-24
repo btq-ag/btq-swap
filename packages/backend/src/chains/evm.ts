@@ -79,7 +79,14 @@ export class EvmChain {
 
   async latestTimestamp(): Promise<number> {
     const b = await this.provider.getBlock('latest');
-    return b?.timestamp ?? Math.floor(Date.now() / 1000);
+    if (!b) throw new Error('EVM head is unavailable');
+    return b.timestamp;
+  }
+
+  async block(height: number): Promise<{ hash: string; timestamp: number }> {
+    const b = await this.provider.getBlock(height);
+    if (!b?.hash) throw new Error(`EVM block ${height} is unavailable`);
+    return { hash: b.hash, timestamp: b.timestamp };
   }
 
   async logs(fromBlock: number, toBlock: number): Promise<HtlcEvent[]> {
@@ -87,8 +94,8 @@ export class EvmChain {
     return raw.map((l) => decodeHtlcLog(l)).filter((e): e is HtlcEvent => e !== null);
   }
 
-  async instance(agreementId: string): Promise<HtlcInstance> {
-    const r = await this.htlc().getFunction('getHTLCInstance').staticCall(agreementId);
+  async instance(agreementId: string, blockTag?: number): Promise<HtlcInstance> {
+    const r = await this.htlc().getFunction('getHTLCInstance').staticCall(agreementId, blockTag === undefined ? {} : { blockTag });
     const partyA = String(r[0]);
     return {
       partyA,

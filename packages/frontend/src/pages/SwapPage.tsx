@@ -24,6 +24,7 @@ export function SwapPage() {
   return (
     <main className="mx-auto max-w-5xl px-5 pb-16 pt-6">
       <Link to="/" className="text-sm text-fog-3 hover:text-fog">← All swaps</Link>
+      <Link to={`/?swap=${s.shortId}`} className="ml-4 text-sm text-evm">Continue or recover this swap</Link>
       <header className="mt-3 flex flex-wrap items-baseline justify-between gap-3">
         <h1 className="text-2xl font-semibold text-fog">
           Swap #{s.shortId}: <span className="text-btq">{trimAmount(s.amountBtq, 8)} BTQ</span> <span className="text-fog-4">⇄</span> <span className="text-evm">{trimAmount(s.amountUsdt, 6)} USDT</span>

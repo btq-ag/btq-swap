@@ -204,6 +204,7 @@ export async function searchSwaps(rawQ: string, filter: SwapFilter, page: number
 export async function cliDescriptor(ref: string) {
   const s = await getSwap(ref);
   if (!s) return null;
+  const rejected = await many<{ chain: string; reason: string; metadata: Record<string, unknown> }>(db(), 'SELECT chain, reason, metadata FROM swap_locks WHERE swap_id = $1 AND reason IS NOT NULL', [s.id]);
   const htlc = s.secret_hash && s.btq_refund_locktime ? toRecord(htlcForSwap(s)) : null;
   return {
     swap: { id: s.id, shortId: Number(s.short_id), status: s.status, network: s.btq_network, amountSats: s.amount_sats, amountBtq: s.amount_btq },
@@ -212,6 +213,7 @@ export async function cliDescriptor(ref: string) {
       lock: s.btq_lock_txid ? { txid: s.btq_lock_txid, vout: s.btq_lock_vout, valueSats: s.btq_lock_sats, confirmations: s.btq_lock_confs } : null,
       tipHeight: btqStatus.tip,
       minConfirmations: config().BTQ_MIN_CONFIRMATIONS,
+      rejectedLocks: rejected.filter(r => r.chain === 'btq').map(r => ({ ...r.metadata, reason: r.reason })),
     },
     evm: {
       chainId: s.evm_chain_id,
@@ -225,6 +227,7 @@ export async function cliDescriptor(ref: string) {
       otherNetwork: btqNetworkTag(s.btq_network),
       otherAsset: swapBindingAsset(s.id),
       otherAmount: s.amount_sats,
+      rejectedLocks: rejected.filter(r => r.chain === 'evm').map(r => ({ ...r.metadata, reason: r.reason })),
       agreementId: s.evm_agreement_id,
       deadline: s.evm_deadline ? Math.floor(new Date(s.evm_deadline).getTime() / 1000) : null,
       secretHash: s.secret_hash,

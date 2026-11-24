@@ -1,3 +1,4 @@
+import { recoverSolanaLock } from '../domain/solana-transactions';
 import rateLimit from 'express-rate-limit';
 import { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
@@ -122,7 +123,7 @@ const proofSchema = z.object({
 publicRoutes.post('/public/desk/evm/start', deskLimit, async (req, res, next) => {
   try {
     const body = z.object({ address: z.string(), acceptTos: z.literal(true) }).parse(req.body);
-    res.json(await beginEvm(body.address, true));
+    res.json(await beginEvm(body.address, true, await optionalDeskUser(req.header('authorization'))));
   } catch (err) {
     next(err);
   }
@@ -130,19 +131,16 @@ publicRoutes.post('/public/desk/evm/start', deskLimit, async (req, res, next) =>
 
 publicRoutes.post('/public/desk/evm/finish', deskLimit, async (req, res, next) => {
   try {
-    const body = z.object({ address: z.string(), signature: z.string() }).parse(req.body);
-    res.json(await completeEvm(body.address, body.signature));
+    const body = z.object({ address: z.string(), signature: z.string(), challengeId: z.string().uuid() }).parse(req.body);
+    res.json(await completeEvm(body.address, body.signature, body.challengeId, await optionalDeskUser(req.header('authorization'))));
   } catch (err) {
     next(err);
   }
 });
 
 async function optionalDeskUser(header: string | undefined) {
-  try {
-    return await userFromToken(bearer(header));
-  } catch {
-    return null;
-  }
+  if (header === undefined) return null;
+  return userFromToken(bearer(header));
 }
 
 publicRoutes.post('/public/desk/sol/start', deskLimit, async (req, res, next) => {
@@ -156,9 +154,9 @@ publicRoutes.post('/public/desk/sol/start', deskLimit, async (req, res, next) =>
 
 publicRoutes.post('/public/desk/sol/finish', deskLimit, async (req, res, next) => {
   try {
-    const body = z.object({ address: z.string(), signature: z.string() }).parse(req.body);
+    const body = z.object({ address: z.string(), signature: z.string(), challengeId: z.string().uuid() }).parse(req.body);
     const session = await optionalDeskUser(req.header('authorization'));
-    const done = await completeSol(body.address, body.signature, session);
+    const done = await completeSol(body.address, body.signature, session, body.challengeId);
     if (done.token) res.json(done);
     else res.json({ profile: done.profile });
   } catch (err) {
@@ -178,9 +176,9 @@ publicRoutes.post('/public/desk/swaps/:ref/sol/prepare', deskLimit, async (req, 
 
 publicRoutes.post('/public/desk/swaps/:ref/sol/submit', deskLimit, async (req, res, next) => {
   try {
-    await userFromToken(bearer(req.header('authorization')));
-    const body = z.object({ signedTx: z.string() }).parse(req.body);
-    res.json(await submitSolTx(body.signedTx));
+    const user = await userFromToken(bearer(req.header('authorization')));
+    const body = z.object({ preparationId: z.string().uuid(), signedTx: z.string().max(4096) }).parse(req.body);
+    res.json(await submitSolTx(user, String(req.params.ref), body.preparationId, body.signedTx));
   } catch (err) {
     next(err);
   }
@@ -207,8 +205,8 @@ publicRoutes.post('/public/desk/btq/start', deskLimit, async (req, res, next) =>
 publicRoutes.post('/public/desk/btq/finish', deskLimit, async (req, res, next) => {
   try {
     const user = await userFromToken(bearer(req.header('authorization')));
-    const proof = proofSchema.parse(req.body) as WalletProof;
-    res.json({ profile: await completeBtq(user, proof, req.header('origin') ?? '') });
+    const { challengeId, ...proof } = proofSchema.extend({ challengeId: z.string().uuid() }).parse(req.body);
+    res.json({ profile: await completeBtq(user, proof as WalletProof, req.header('origin') ?? '', challengeId) });
   } catch (err) {
     next(err);
   }
@@ -251,4 +249,12 @@ publicRoutes.post('/public/desk/swaps/:ref/btq-lock', deskLimit, async (req, res
   } catch (err) {
     next(err);
   }
+});
+
+publicRoutes.post('/public/desk/swaps/:ref/sol/recover', deskLimit, async (req, res, next) => {
+  try {
+    const user = await userFromToken(bearer(req.header('authorization')));
+    const body = z.object({ signature: z.string().min(80).max(90) }).parse(req.body);
+    res.json(await recoverSolanaLock(user.id, String(req.params.ref), body.signature));
+  } catch (err) { next(err); }
 });

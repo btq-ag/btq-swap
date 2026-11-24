@@ -4,5 +4,6 @@ export * from './address.js';
 export * from './tx.js';
 export * from './keys.js';
 export * from './htlc.js';
+export * from './guards.js';
 export * from './rpc.js';
 export * from "./evm.js";

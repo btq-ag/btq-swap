@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { Link, useSearchParams } from 'react-router-dom';
 import { getJson, type MonitorState, type SwapDetail, type SwapView } from '../api';
 import { CandleChart, type Candle } from '../components/trade/CandleChart';
 import { OrderBook, type BookRow } from '../components/trade/OrderBook';
@@ -47,13 +47,13 @@ function statusLine(plan: LockPlan | null): string {
   if (plan.solRefund) return 'The timeout has passed. The Solana wallet can refund the tokens.';
   if (plan.usdtClaim) return 'The secret is on-chain. Collect the USDT before the timelock.';
   if (plan.usdtRefund) return 'The timeout has passed. MetaMask can refund the USDT.';
-  if (plan.role === 'buyer' && plan.status === 'awaiting_buyer_claim') return 'Claim the BTQ before the refund height. The browser wallet cannot sign this script.';
+  if (plan.btqClaim) return 'Claim the BTQ before the refund height. The browser wallet cannot sign this script.';
   return `Swap #${plan.shortId} is ${plan.status.replace(/_/g, ' ')}.`;
 }
 
 function yourTurn(plan: LockPlan | null): boolean {
   if (!plan) return false;
-  return !!(plan.evmLock || plan.btqSend || plan.usdtClaim || plan.usdtRefund || plan.solLock || plan.solClaim || plan.solRefund || (plan.role === 'buyer' && plan.status === 'awaiting_buyer_claim'));
+  return !!(plan.evmLock || plan.btqSend || plan.usdtClaim || plan.usdtRefund || plan.solLock || plan.solClaim || plan.solRefund || (plan.btqClaim));
 }
 
 function clock(targetMs: number, now: number): string {
@@ -68,6 +68,8 @@ function clock(targetMs: number, now: number): string {
 }
 
 export function TradeDesk() {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [existingSwapRef, setExistingSwapRef] = useState(() => searchParams.get('swap') ?? '');
   const monitor = usePoll(() => getJson<MonitorState>('/public/monitor'), 2000);
   const liveBook = usePoll(() => getJson<MonitorState['book']>('/public/book'), 400);
   const data = monitor.data;
@@ -84,9 +86,13 @@ export function TradeDesk() {
   const [stage, setStage] = useState<'edit' | 'preview' | 'secret'>('edit');
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [recoverySignature, setRecoverySignature] = useState('');
   const [fault, setFault] = useState<string | null>(null);
   const [swapId, setSwapId] = useState<number | null>(null);
   const [plan, setPlan] = useState<LockPlan | null>(null);
+  const selection = useRef<{ ref: string | null; profile: DeskProfile | null } | null>(null);
+  selection.current = { ref: searchParams.get('swap'), profile };
+  useEffect(() => () => { selection.current = null; }, []);
   const now = useNow(1000);
   const swapPoll = usePoll(
     () => (swapId ? getJson<SwapDetail>(`/public/swaps/${swapId}`) : Promise.resolve(null)),
@@ -124,6 +130,17 @@ export function TradeDesk() {
     const timer = setInterval(tick, 2000);
     return () => { alive = false; clearInterval(timer); };
   }, [swapId]);
+
+  useEffect(() => {
+    const ref = searchParams.get('swap');
+    let alive = true;
+    setPlan(null); setSwapId(null); setFault(null); setNotice(null); setBusy(value => value === 'Recovering lock' ? null : value); setRecoverySignature(''); setExistingSwapRef(ref ?? '');
+    if (!ref || !profile) return;
+    deskApi.plan(ref).then(p => {
+      if (alive) { setSwapId(p.shortId); setPlan(p); }
+    }).catch(err => { if (alive) setFault(walletError(err)); });
+    return () => { alive = false; };
+  }, [searchParams, profile]);
 
   const level = useMemo(() => {
     const rows = side === 'buy' ? asks : bids;
@@ -163,11 +180,11 @@ export function TradeDesk() {
     setBusy('BTQ wallet');
     try {
       await connectBtq();
-      const { challenge } = await deskApi.btqStart();
+      const { challenge, challengeId } = await deskApi.btqStart();
       const btq = btqProvider();
       if (!btq) throw new Error('The BTQ wallet extension is not installed in this browser.');
       const proof = await btq.signMessage({ message: challenge });
-      const done = await deskApi.btqFinish(proof);
+      const done = await deskApi.btqFinish(proof, challengeId);
       setProfile(done.profile);
       setNotice(`BTQ wallet ${shortAddr(done.profile.btq)} is linked.`);
     } catch (err) {
@@ -188,8 +205,9 @@ export function TradeDesk() {
       }
       setNotice('Approve the Solana transaction in the wallet.');
       const prepared = await deskApi.solPrepare(current.shortId, action, secretHash);
-      const signed = await signSolanaTransaction(Transaction.from(base64ToBytes(prepared.tx)));
-      const sent = await deskApi.solSubmit(current.shortId, bytesToBase64(signed.serialize()));
+      const transaction = Transaction.from(base64ToBytes(prepared.tx));
+      const signed = prepared.signed ? transaction : await signSolanaTransaction(transaction);
+      const sent = await deskApi.solSubmit(current.shortId, prepared.preparationId, bytesToBase64(signed.serialize()));
       setNotice(`Solana transaction ${sent.signature.slice(0, 8)} confirmed.`);
       return;
     }
@@ -260,6 +278,7 @@ export function TradeDesk() {
     try {
       const taken = await deskApi.take(level.orderNo, amount);
       setSwapId(taken.shortId);
+      setSearchParams({ swap: String(taken.shortId) });
       if (side === 'buy') {
         const pending = sessionStorage.getItem('btq-secret-pending');
         if (pending) {
@@ -271,9 +290,9 @@ export function TradeDesk() {
       }
       const next = await deskApi.plan(taken.shortId);
       setPlan(next);
-      const eth = profile.eth;
-      if (!eth) throw new Error('The EVM wallet address is missing.');
-      await runPlan(next, eth);
+      const wallet = next.rail === 'solana' ? profile.sol : profile.eth;
+      if (!wallet) throw new Error('The settlement wallet address is missing.');
+      await runPlan(next, wallet);
       setStage('edit');
     } catch (err) {
       setFault(walletError(err));
@@ -283,15 +302,39 @@ export function TradeDesk() {
   }
 
   async function continueSwap() {
-    if (!plan || !profile?.eth) return;
+    if (!plan || !profile) return;
+    const wallet = plan.rail === 'solana' ? profile.sol : profile.eth;
+    if (!wallet) { setFault('Connect the wallet for this settlement rail.'); return; }
     setFault(null);
     setBusy('Wallet');
     try {
-      await runPlan(plan, profile.eth);
+      await runPlan(plan, wallet);
     } catch (err) {
       setFault(walletError(err));
     } finally {
       setBusy(null);
+    }
+  }
+
+  async function recoverLock() {
+    if (!swapId || !profile) return;
+    const ref = searchParams.get('swap');
+    const token = deskToken();
+    if (!token) { setProfile(null); return; }
+    const sameSelection = () => selection.current?.ref === ref && selection.current?.profile === profile;
+    const current = () => sameSelection() && deskToken() === token;
+    setBusy('Recovering lock'); setFault(null);
+    try {
+      await deskApi.solRecover(swapId, recoverySignature.trim());
+      if (!current()) return;
+      const recovered = await deskApi.plan(swapId);
+      if (current()) { setPlan(recovered); setNotice('Existing escrow recovered. Its confirmed state is shown here.'); }
+    } catch (err) { if (sameSelection()) setFault(walletError(err)); }
+    finally {
+      if (sameSelection()) {
+        setBusy(null);
+        if (deskToken() !== token) setProfile(null);
+      }
     }
   }
 
@@ -350,8 +393,21 @@ export function TradeDesk() {
           </div>
           <CandleChart candles={candlePoll.data?.candles ?? []} intervalSec={intervalSec} />
           <div className="border-t border-white/10 px-4 py-3">
+            <div className="mb-3 flex gap-2">
+              <input aria-label="Existing swap number or ID" placeholder="Swap number or ID" className="min-w-0 flex-1 rounded-control bg-ink px-2 py-1 text-[12px]" value={existingSwapRef} onChange={e => setExistingSwapRef(e.target.value)} />
+              <button type="button" disabled={!profile || !!busy || !existingSwapRef.trim()} className="text-[12px] text-evm disabled:opacity-40" onClick={() => setSearchParams({ swap: existingSwapRef.trim() })}>Open swap</button>
+            </div>
+            {!profile && <p className="mb-2 text-[12px] text-fog-3">Connect your linked wallet to reopen an existing swap.</p>}
             <h2 className="text-[13px] font-semibold text-fog">{swapId ? `Swap #${swapId}` : 'No swap in progress'}</h2>
             <p className="mt-1 max-w-xl text-[12px] text-fog-3">{holding ? 'Finish the step on the right before the timelock.' : statusLine(plan)}</p>
+            {swapId && plan?.rail === 'solana' && plan.role === 'buyer' && !plan.solRefund && !plan.solClaim && (
+              <details className="mt-3 text-[12px] text-fog-2">
+                <summary>Already locked tokens? Recover an existing transaction</summary>
+                <p className="mt-2">Paste the lock transaction signature from your wallet. The desk checks the escrow and its settlement history.</p>
+                <input aria-label="Solana lock transaction signature" className="mt-2 w-full rounded-control bg-ink px-2 py-1" value={recoverySignature} onChange={e => setRecoverySignature(e.target.value)} />
+                <button type="button" disabled={!!busy || !recoverySignature.trim()} className="mt-2 text-evm disabled:opacity-40" onClick={() => void recoverLock()}>Recover existing lock</button>
+              </details>
+            )}
             {swapId && <Link to={`/swap/${swapId}`} className="mt-2 inline-block text-[12px] text-evm">Open the settlement view</Link>}
           </div>
         </div>
@@ -470,7 +526,7 @@ function turnCopy(plan: LockPlan, swap: SwapView | null, tip: number, blockSec: 
   }
   if (plan.solClaim) {
     const at = swap?.evm.deadline ? new Date(swap.evm.deadline).getTime() : 0;
-    return { title: 'Collect the tokens', clock: at ? clock(at, now) : '—', detail: 'The buyer already has the BTQ. The Solana wallet has to send this claim before the clock ends.', action: 'Collect tokens' };
+    return { title: 'Collect the tokens', clock: at ? clock(at, now) : '—', detail: 'The secret is public. The Solana wallet has to send this claim before the clock ends.', action: 'Collect tokens' };
   }
   if (plan.solRefund) {
     return { title: 'Refund the tokens', clock: 'Open', detail: 'The timelock has passed. The Solana wallet returns the tokens to you.', action: 'Refund tokens' };
@@ -480,11 +536,11 @@ function turnCopy(plan: LockPlan, swap: SwapView | null, tip: number, blockSec: 
     return {
       title: 'Collect the USDT',
       clock: at ? clock(at, now) : '—',
-      detail: 'The buyer already has the BTQ. MetaMask has to send this claim before the clock ends. After that, the buyer can take the USDT back.',
+      detail: 'The secret is public. MetaMask has to send this claim before the clock ends. After that, the buyer can take the USDT back.',
       action: 'Collect USDT',
     };
   }
-  if (plan.role === 'buyer' && plan.status === 'awaiting_buyer_claim') {
+  if (plan.btqClaim) {
     const height = swap?.btq.refundLocktime;
     const blocks = height ? height - tip : -1;
     return {
@@ -518,7 +574,7 @@ function TurnGate({ plan, swap, tip, blockSec, now, busy, notice, fault, btqAddr
   onAct: () => void;
 }) {
   const step = turnCopy(plan, swap, tip, blockSec, now);
-  const claim = plan.role === 'buyer' && plan.status === 'awaiting_buyer_claim';
+  const claim = plan.btqClaim;
   const command = `btq-htlc claim --swap ${plan.shortId} --api ${window.location.origin}/api${btqAddress ? ` --to ${btqAddress}` : ''} --broadcast`;
   return (
     <section className="flex flex-col bg-ink-2 p-4" aria-label="Required step">

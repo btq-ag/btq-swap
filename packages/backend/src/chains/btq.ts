@@ -56,18 +56,18 @@ export class BtqChain {
     return this.rpc.call<BtqBlock>('getblock', [hash, 2]);
   }
 
-  async rawTx(txid: string): Promise<string> {
-    return this.rpc.call<string>('getrawtransaction', [txid, false]);
+  async rawTx(txid: string, blockHash?: string): Promise<string> {
+    return this.rpc.call<string>('getrawtransaction', blockHash ? [txid, false, blockHash] : [txid, false]);
   }
 
   async txConfirmations(txid: string): Promise<{ confirmations: number; blockhash?: string; height?: number }> {
     const t = await this.rpc.call<{ confirmations?: number; blockhash?: string }>('getrawtransaction', [txid, true]);
     let height: number | undefined;
-    if (t.blockhash) {
-      const h = await this.rpc.call<{ height: number }>('getblockheader', [t.blockhash, true]);
-      height = h.height;
+    if (t.blockhash && (t.confirmations ?? 0) > 0) {
+      const h = await this.rpc.call<{ height: number; confirmations: number }>('getblockheader', [t.blockhash, true]);
+      if (h.confirmations > 0 && await this.blockHash(h.height) === t.blockhash) height = h.height;
     }
-    return { confirmations: t.confirmations ?? 0, blockhash: t.blockhash, height };
+    return { confirmations: height === undefined ? 0 : t.confirmations!, blockhash: height === undefined ? undefined : t.blockhash, height };
   }
 
   async mempoolTxids(): Promise<string[]> {

@@ -29,6 +29,12 @@ export function claimRefusal(c: ClaimCheck): string | null {
   if (!Number.isInteger(c.tipHeight) || c.tipHeight <= 0) {
     return 'the BTQ tip height is unknown; pass --rpc to your own node and try again';
   }
+  if (!Number.isSafeInteger(c.lockConfirmations) || c.lockConfirmations < 0 ||
+      !Number.isSafeInteger(c.minConfirmations) || c.minConfirmations < 1 ||
+      !Number.isSafeInteger(c.marginBlocks) || c.marginBlocks < 1 ||
+      !Number.isSafeInteger(c.refundLocktime) || c.refundLocktime <= 0) {
+    return 'invalid confirmation or refund-height safety parameters; do not claim';
+  }
   if (c.lockConfirmations < c.minConfirmations) {
     return `the BTQ lock has ${c.lockConfirmations} of ${c.minConfirmations} confirmations; claiming now would reveal your secret against funding that can still be replaced`;
   }

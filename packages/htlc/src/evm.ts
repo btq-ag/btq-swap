@@ -6,6 +6,7 @@ export interface LogLike {
   data: string;
   transactionHash: string;
   blockNumber: number;
+  blockHash?: string;
   index: number;
 }
 
@@ -119,10 +120,10 @@ export async function readInstance(contract: Contract, agreementId: string): Pro
   };
 }
 
-export type HtlcEvent =
+export type HtlcEvent = { blockHash?: string } & (
   | ({ kind: 'lockup'; agreementId: string; txHash: string; blockNumber: number; logIndex: number } & Omit<HtlcLockParams, never>)
   | { kind: 'claimed'; agreementId: string; txHash: string; blockNumber: number; logIndex: number }
-  | { kind: 'redeemed'; agreementId: string; txHash: string; blockNumber: number; logIndex: number };
+  | { kind: 'redeemed'; agreementId: string; txHash: string; blockNumber: number; logIndex: number });
 
 export function decodeHtlcLog(log: LogLike): HtlcEvent | null {
   let parsed;
@@ -132,7 +133,7 @@ export function decodeHtlcLog(log: LogLike): HtlcEvent | null {
     return null;
   }
   if (!parsed) return null;
-  const base = { agreementId: String(parsed.args.agreementId).toLowerCase(), txHash: log.transactionHash, blockNumber: log.blockNumber, logIndex: log.index };
+  const base = { agreementId: String(parsed.args.agreementId).toLowerCase(), txHash: log.transactionHash, blockNumber: log.blockNumber, blockHash: log.blockHash, logIndex: log.index };
   if (parsed.name === 'HTLCERC20Lockup') {
     return {
       kind: 'lockup',

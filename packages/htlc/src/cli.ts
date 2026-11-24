@@ -18,7 +18,9 @@ import { buildClaimTx, buildRefundTx, fromRecord, type HtlcRecord } from './htlc
 import { hashPreimage, linkChallengeMessage, newPreimage, newSeed, signerFromSeed, type DilithiumSigner } from './keys.js';
 import { BtqRpc, btqToSats } from './rpc.js';
 import { claimRefusal, DEFAULT_CLAIM_MARGIN_BLOCKS, DEFAULT_MIN_CONFIRMATIONS } from './guards.js';
-import { erc20Contract, htlcContract, readInstance } from './evm.js';
+import { computeAgreementId, erc20Contract, htlcContract, readInstance } from './evm.js';
+
+import { createSecretFile, deploymentUrl, loadSecretFile, markSecretUsed } from './secrets.js';
 
 export const CLI_VERSION = '1.0.0';
 
@@ -30,6 +32,7 @@ export interface SwapDescriptor {
     tipHeight: number;
     /** Server's BTQ_MIN_CONFIRMATIONS (absent on older servers). */
     minConfirmations?: number;
+    rejectedLocks?: Array<{ txid: string; vout: number; valueSats: string; htlc: HtlcRecord; reason: string }>;
   };
   evm: {
     chainId: number;
@@ -94,10 +97,6 @@ export function loadSigner(home: string): DilithiumSigner {
   return signerFromSeed(hexToBytes(k.seed));
 }
 
-function secretPath(home: string, swap: string): string {
-  return join(home, 'secrets', `${swap}.json`);
-}
-
 /** Find the local preimage for a hash (any swap file). */
 export function findSecretByHash(home: string, secretHashHex: string): Uint8Array | null {
   const dir = join(home, 'secrets');
@@ -113,8 +112,12 @@ export function findSecretByHash(home: string, secretHashHex: string): Uint8Arra
   return null;
 }
 
+function apiUrl(args: Args): string {
+  return deploymentUrl(flag(args, 'api', 'BTQ_SWAP_API') ?? 'http://127.0.0.1:5173/api');
+}
+
 async function fetchDescriptor(args: Args): Promise<SwapDescriptor> {
-  const api = (flag(args, 'api', 'BTQ_SWAP_API') ?? 'http://127.0.0.1:5173/api').replace(/\/+$/, '');
+  const api = apiUrl(args);
   const swap = need(args, 'swap');
   const res = await fetch(`${api}/public/swaps/${encodeURIComponent(swap)}/htlc`);
   if (!res.ok) throw new Error(`swap ${swap}: API returned ${res.status} ${await res.text()}`);
@@ -139,11 +142,26 @@ async function cmdClaimOrRefund(kind: 'claim' | 'refund', args: Args): Promise<v
   const home = homeDir(args);
   const signer = loadSigner(home);
   const d = await fetchDescriptor(args);
-  if (!d.btq.htlc || !d.btq.lock) throw new Error(`swap ${d.swap.shortId} has no confirmed BTQ lock yet (status ${d.swap.status})`);
-  const htlc = fromRecord(d.btq.htlc); // rebuilds from parameters and checks the address
+  const explicit = flag(args, 'outpoint');
+  if (explicit && kind !== 'refund') throw new Error('--outpoint is only supported for refunds');
+  const match = explicit ? /^([0-9a-fA-F]{64}):(\d+)$/.exec(explicit) : null;
+  if (explicit && (!match || !Number.isSafeInteger(Number(match[2])) || Number(match[2]) > 0xffffffff)) throw new Error('--outpoint must be txid:vout');
+  const rejected = match ? d.btq.rejectedLocks?.find(o => o.txid.toLowerCase() === match[1]!.toLowerCase() && o.vout === Number(match[2])) : null;
+  const record = rejected?.htlc ?? d.btq.htlc;
+  if (!record || (!d.btq.lock && !match)) throw new Error(`swap ${d.swap.shortId} has no accepted BTQ lock; use --outpoint txid:vout --rpc URL for a rejected lock`);
+  const htlc = fromRecord(record); // rebuilds from parameters and checks the address
   const to = need(args, 'to');
   decodeSegwitAddress(to, htlc.network);
-  const outpoint = { txid: d.btq.lock.txid, vout: d.btq.lock.vout, valueSats: BigInt(d.btq.lock.valueSats) };
+  let outpoint = d.btq.lock ? { txid: d.btq.lock.txid, vout: d.btq.lock.vout, valueSats: BigInt(d.btq.lock.valueSats) } : null;
+  if (match) {
+    const node = rpcFrom(args);
+    if (!node) throw new Error('an explicit refund outpoint requires --rpc to verify its script and actual value');
+    const txid = match[1]!.toLowerCase(); const vout = Number(match[2]);
+    const output = await node.call<{ value: number; scriptPubKey: { hex: string } } | null>('gettxout', [txid, vout, true]);
+    if (!output || output.scriptPubKey.hex.toLowerCase() !== bytesToHex(htlc.scriptPubKey)) throw new Error('the explicit outpoint is missing, spent, or does not pay this HTLC');
+    outpoint = { txid, vout, valueSats: btqToSats(output.value.toFixed(8)) };
+  }
+  if (!outpoint) throw new Error('no refundable outpoint');
   const feeRate = Number(flag(args, 'fee-rate') ?? '2');
   let signed;
   if (kind === 'claim') {
@@ -152,7 +170,7 @@ async function cmdClaimOrRefund(kind: 'claim' | 'refund', args: Args): Promise<v
     if (!preimage) throw new Error(`no local secret matches hash ${bytesToHex(htlc.secretHash)} — did you run "btq-htlc secret new" on this machine?`);
     const minConfirmations = Math.max(Number(flag(args, 'min-confirmations') ?? 0), d.btq.minConfirmations ?? DEFAULT_MIN_CONFIRMATIONS);
     const marginBlocks = Number(flag(args, 'claim-margin-blocks') ?? DEFAULT_CLAIM_MARGIN_BLOCKS);
-    let lockConfirmations = d.btq.lock.confirmations;
+    let lockConfirmations = d.btq.lock!.confirmations;
     let tipHeight = d.btq.tipHeight;
     const node = rpcFrom(args);
     if (node) {
@@ -169,8 +187,10 @@ async function cmdClaimOrRefund(kind: 'claim' | 'refund', args: Args): Promise<v
     signed = buildClaimTx({ htlc, outpoint, destination: to, preimage, signer, feeRateSatVb: feeRate });
   } else {
     if (!equalBytes(signer.publicKey, htlc.refundPubkey)) throw new Error('this HTLC is not refundable by your key (you are not the seller)');
-    if (d.btq.tipHeight < htlc.refundLocktime) {
-      throw new Error(`refund opens at BTQ height ${htlc.refundLocktime} (tip ${d.btq.tipHeight}); try again later`);
+    const refundNode = rpcFrom(args);
+    const tipHeight = refundNode ? await refundNode.call<number>('getblockcount') : d.btq.tipHeight;
+    if (!Number.isSafeInteger(tipHeight) || tipHeight < htlc.refundLocktime) {
+      throw new Error(`refund opens at BTQ height ${htlc.refundLocktime} (tip ${tipHeight}); try again later`);
     }
     signed = buildRefundTx({ htlc, outpoint, destination: to, signer, feeRateSatVb: feeRate });
   }
@@ -210,35 +230,43 @@ async function cmdEvm(sub: string, args: Args): Promise<void> {
   if (sub === 'lock') {
     if (wallet.address.toLowerCase() !== d.evm.buyer.toLowerCase()) throw new Error(`key ${wallet.address} is not the swap buyer ${d.evm.buyer}`);
     const home = homeDir(args);
-    const file = secretPath(home, String(d.swap.shortId));
-    if (!existsSync(file)) throw new Error(`no secret for swap ${d.swap.shortId} — run: btq-htlc secret new --swap ${d.swap.shortId}`);
-    const s = JSON.parse(readFileSync(file, 'utf8')) as { secretHash: string };
+    if (d.swap.status !== 'awaiting_buyer_lock' || d.evm.agreementId) throw new Error('this swap is not awaiting a new EVM lock');
+    const s = loadSecretFile(home, apiUrl(args), d.swap.id);
     const latest = await provider.getBlock('latest');
     const deadline = Number(flag(args, 'deadline') ?? (latest!.timestamp + d.evm.lockDurationSec));
     const amount = BigInt(d.evm.amountUnits);
     const token = erc20Contract(d.evm.token, wallet);
     const allowance: bigint = await token.getFunction('allowance')(wallet.address, d.evm.htlcContract);
     if (allowance < amount) await (await token.getFunction('approve')(d.evm.htlcContract, amount)).wait();
+    const agreementId = computeAgreementId({ partyA: wallet.address, partyB: d.evm.seller,
+      secretlock: `0x${s.secretHash}`, deadline, erc20Contract: d.evm.token, tokenAmount: amount,
+      otherNetwork: d.evm.otherNetwork, otherAsset: d.evm.otherAsset, otherAmount: BigInt(d.evm.otherAmount) });
+    markSecretUsed(home, s, agreementId);
+    // Print recovery information before submission, including when the receipt request later fails.
+    out({ lockAttempt: true, agreementId, deadline, secretHash: s.secretHash });
     const tx = await htlc.getFunction('createHTLCProposal')([
       d.evm.seller, `0x${s.secretHash}`, deadline, d.evm.token, amount, d.evm.otherNetwork, d.evm.otherAsset, BigInt(d.evm.otherAmount),
     ]);
     const r = await tx.wait();
-    out({ locked: true, txHash: r!.hash, deadline, secretHash: s.secretHash });
+    out({ locked: true, agreementId, txHash: r!.hash, deadline, secretHash: s.secretHash });
     return;
   }
-  if (!d.evm.agreementId) throw new Error('swap has no EVM lock yet');
+  const agreementId = sub === 'refund' ? (flag(args, 'agreement-id') ?? d.evm.agreementId) : d.evm.agreementId;
+  if (!agreementId || !/^0x[0-9a-fA-F]{64}$/.test(agreementId)) throw new Error('no accepted EVM lock; specify --agreement-id for a rejected lock');
   if (sub === 'claim') {
     const pre = flag(args, 'preimage') ?? d.preimage;
     if (!pre) throw new Error('preimage not revealed yet — wait until the buyer claims BTQ');
-    const inst = await readInstance(htlc, d.evm.agreementId);
+    const inst = await readInstance(htlc, agreementId);
     if (wallet.address.toLowerCase() !== inst.partyB.toLowerCase()) throw new Error(`key ${wallet.address} is not partyB ${inst.partyB}`);
     if (!equalBytes(hashPreimage(hexToBytes(pre)), hexToBytes(inst.secretlock))) throw new Error('preimage does not open this lock');
-    const r = await (await htlc.getFunction('withdrawTokens')(d.evm.agreementId, pre.startsWith('0x') ? pre : `0x${pre}`)).wait();
+    const r = await (await htlc.getFunction('withdrawTokens')(agreementId, pre.startsWith('0x') ? pre : `0x${pre}`)).wait();
     out({ claimed: true, txHash: r!.hash });
     return;
   }
   if (sub === 'refund') {
-    const r = await (await htlc.getFunction('refundTokens')(d.evm.agreementId)).wait();
+    const inst = await readInstance(htlc, agreementId);
+    if (!inst.exists || wallet.address.toLowerCase() !== inst.partyA.toLowerCase()) throw new Error('this agreement is not refundable by your wallet');
+    const r = await (await htlc.getFunction('refundTokens')(agreementId)).wait();
     out({ refunded: true, txHash: r!.hash });
     return;
   }
@@ -250,11 +278,13 @@ const HELP = `btq-htlc ${CLI_VERSION} — non-custodial BTQ Swap signer
   btq-htlc keygen                        create your swap key (~/.btq-htlc/key.json)
   btq-htlc pubkey                        print your swap public key (base64)
   btq-htlc link <challenge>              sign the /swap link-btq challenge
-  btq-htlc secret new --swap <n>         create the swap secret (buyer); prints its SHA-256
+  btq-htlc secret new --swap <n>         create a deployment + UUID scoped secret; prints its SHA-256
   btq-htlc secret show --swap <n>
   btq-htlc claim  --swap <n> --to <btq address> [--api URL] [--broadcast [--rpc URL --rpcuser U --rpcpass P]]
-  btq-htlc refund --swap <n> --to <btq address> [...]
+  btq-htlc refund --swap <n> --to <btq address> [--outpoint txid:vout --rpc URL] [...]
   btq-htlc evm lock|claim|refund --swap <n> --evm-rpc URL --key env:VAR   (wallets without MetaMask)
+
+  Rejected EVM lock: evm refund --swap <n> --agreement-id <0x...> --evm-rpc URL --key env:VAR
 
   Global: --home DIR (or BTQ_HTLC_HOME), --api URL (or BTQ_SWAP_API)`;
 
@@ -283,22 +313,15 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       return;
     }
     case 'secret': {
-      const swap = need(args, 'swap');
-      mkdirSync(join(home, 'secrets'), { recursive: true, mode: 0o700 });
-      const file = secretPath(home, swap);
+      const d = await fetchDescriptor(args);
+      const api = apiUrl(args);
       if (sub === 'new') {
-        if (existsSync(file)) {
-          const s = JSON.parse(readFileSync(file, 'utf8')) as { secretHash: string };
-          out({ swap, secretHash: s.secretHash, note: 'existing secret reused' });
-          return;
-        }
-        const p = newPreimage();
-        writePrivate(file, { swap, preimage: p.preimageHex, secretHash: p.secretHashHex, created: new Date().toISOString() });
-        out({ swap, secretHash: p.secretHashHex });
+        const p = createSecretFile(home, api, d.swap.id, d.swap.shortId);
+        out({ swapId: p.swapId, shortId: p.shortId, deployment: p.deployment, secretHash: p.secretHash });
         return;
       }
       if (sub === 'show') {
-        out(JSON.parse(readFileSync(file, 'utf8')));
+        out(loadSecretFile(home, api, d.swap.id));
         return;
       }
       throw new Error('usage: btq-htlc secret new|show --swap <n>');

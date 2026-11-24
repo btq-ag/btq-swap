@@ -1,13 +1,12 @@
-import { btqToSats, bytesToHex, parseTx, txid as computeTxid } from '@btq-swap/htlc';
+import { BtqRpcError, btqToSats, bytesToHex, parseTx, txid as computeTxid } from '@btq-swap/htlc';
 import { btqChain } from '../chains/btq';
 import { db, many } from '../lib/db';
 import { createLogger } from '../lib/logger';
-import { onBtqLockConfirmations, onBtqLockOutput, onBtqSpend, runDeadlines } from '../domain/settlement';
+import { clearBtqObservation, onBtqLockConfirmations, onBtqLockOutput, onBtqSpend, runDeadlines } from '../domain/settlement';
 import type { SwapRow } from '../domain/types';
-import { getCursor, setCursor } from './cursors';
+import { canonicalCursor, setCursor } from './cursors';
 
 const log = createLogger('btq-watcher');
-const REORG_DEPTH = 12;
 
 export const btqStatus = { tip: 0, tipHash: '', cursor: 0, lag: 0, lastTickAt: 0, mempool: 0 };
 
@@ -19,14 +18,12 @@ interface Watch {
 async function loadWatch(): Promise<Watch> {
   const rows = await many<SwapRow>(
     db(),
-    `SELECT * FROM swaps WHERE
-       (status IN ('awaiting_seller_lock','seller_lock_confirming','awaiting_buyer_refund','expired') AND btq_htlc_spk IS NOT NULL AND btq_lock_txid IS NULL AND updated_at > now() - interval '2 days')
-    OR (btq_lock_txid IS NOT NULL AND btq_claim_txid IS NULL AND btq_refund_txid IS NULL)`,
+    `SELECT * FROM swaps WHERE btq_htlc_spk IS NOT NULL`,
   );
   const w: Watch = { bySpk: new Map(), byOutpoint: new Map() };
   for (const s of rows) {
-    if (s.btq_htlc_spk && !s.btq_lock_txid) w.bySpk.set(s.btq_htlc_spk, s);
-    if (s.btq_lock_txid && s.btq_lock_vout !== null) w.byOutpoint.set(`${s.btq_lock_txid}:${s.btq_lock_vout}`, s);
+    if (s.btq_htlc_spk) w.bySpk.set(s.btq_htlc_spk, s);
+    if (s.btq_lock_txid && s.btq_lock_vout !== null && !s.btq_claim_txid && !s.btq_refund_txid) w.byOutpoint.set(`${s.btq_lock_txid}:${s.btq_lock_vout}`, s);
   }
   return w;
 }
@@ -38,38 +35,48 @@ interface TxView {
   outputs: Array<{ spk: string; sats: bigint; n: number }>;
 }
 
-async function processTx(t: TxView, height: number | null, tip: number, w: Watch): Promise<void> {
+async function processTx(t: TxView, height: number | null, tip: number, w: Watch, blockHash: string | null = null): Promise<boolean> {
+  let touched = false;
   for (const o of t.outputs) {
     const s = w.bySpk.get(o.spk);
-    if (s) await onBtqLockOutput(s.id, { txid: t.txid, vout: o.n, sats: o.sats, height }, tip);
+    if (s) { touched = true; await onBtqLockOutput(s.id, { txid: t.txid, vout: o.n, sats: o.sats, height, blockHash }, tip); }
   }
   for (const i of t.inputs) {
     const s = w.byOutpoint.get(`${i.txid}:${i.vout}`);
-    if (s) await onBtqSpend(s.id, t.hex, t.txid);
+    if (s) { touched = true; await onBtqSpend(s.id, t.hex, t.txid, height !== null && blockHash ? { height, hash: blockHash, tip } : null, tip); }
   }
+  return touched;
 }
 
-const seenMempool = new Set<string>();
+async function confirmation(txid: string) {
+  try { return await btqChain().txConfirmations(txid); }
+  catch (err) { if (err instanceof BtqRpcError && err.code === -5) return null; throw err; }
+}
 
 export async function btqTick(): Promise<number> {
   const chain = btqChain();
   const tip = await chain.tip();
-  let cur = await getCursor('btq');
-  if (!cur) {
-    cur = { height: Math.max(0, tip.height - 1), hash: null };
-  }
-  // reorg check: if the block at our cursor changed, rescan the last REORG_DEPTH blocks (handlers are idempotent)
-  if (cur.hash && cur.height <= tip.height) {
-    const hashNow = await chain.blockHash(cur.height).catch(() => null);
-    if (hashNow !== cur.hash) {
-      const h = Math.max(0, cur.height - REORG_DEPTH);
-      log.warn('BTQ reorg detected, rescanning', { from: h, storedHeight: cur.height });
-      cur = { height: h, hash: null };
+  const mempool = await chain.mempoolTxids();
+  const live = new Set(mempool);
+  // Reconcile before scanning the replacement branch, including already-promoted and terminal rows.
+  const observed = await many<SwapRow>(db(), 'SELECT * FROM swaps WHERE btq_lock_txid IS NOT NULL');
+  for (const s of observed) {
+    const funding = await confirmation(s.btq_lock_txid!);
+    if (funding?.height === undefined && !live.has(s.btq_lock_txid!)) {
+      await clearBtqObservation(s.id, 'lock', tip.height); continue;
     }
-  } else if (cur.height > tip.height) {
-    cur = { height: Math.max(0, tip.height - REORG_DEPTH), hash: null };
+    await onBtqLockConfirmations(s.id, funding?.height !== undefined && funding.blockhash ? { height: funding.height, hash: funding.blockhash } : null, tip.height);
+    const spendId = s.btq_pending_spend_txid ?? s.btq_claim_txid ?? s.btq_refund_txid;
+    if (spendId) {
+      const spend = await confirmation(spendId);
+      if (spend?.height === undefined && !live.has(spendId)) await clearBtqObservation(s.id, 'spend', tip.height);
+      else {
+        const raw = await chain.rawTx(spendId, spend?.blockhash);
+        await onBtqSpend(s.id, raw, spendId, spend?.height !== undefined && spend.blockhash ? { height: spend.height, hash: spend.blockhash, tip: tip.height } : null, tip.height);
+      }
+    }
   }
-
+  const cur = await canonicalCursor('btq', tip.height, h => chain.blockHash(h), Math.max(-1, tip.height - 1));
   let watch = await loadWatch();
   for (let h = cur.height + 1; h <= tip.height; h++) {
     const hash = await chain.blockHash(h);
@@ -83,43 +90,29 @@ export async function btqTick(): Promise<number> {
       };
       const hit = view.outputs.some((o) => watch.bySpk.has(o.spk)) || view.inputs.some((i) => watch.byOutpoint.has(`${i.txid}:${i.vout}`));
       if (hit) {
-        await processTx(view, h, tip.height, watch);
+        if (await chain.blockHash(h) !== hash) throw new Error('BTQ branch changed during scan');
+        await processTx(view, h, tip.height, watch, hash);
         watch = await loadWatch();
       }
     }
+    if (await chain.blockHash(h) !== hash) throw new Error('BTQ branch changed during scan');
     await setCursor('btq', h, hash);
   }
 
-  // mempool: learn locks and preimages at 0-conf
-  const mempool = await chain.mempoolTxids();
+  // Retry fetching on every tick. A failed fetch or child-before-parent order must never hide a secret.
   btqStatus.mempool = mempool.length;
-  const live = new Set(mempool);
-  for (const id of seenMempool) if (!live.has(id)) seenMempool.delete(id);
+  const views: TxView[] = [];
   for (const id of mempool) {
-    if (seenMempool.has(id)) continue;
-    seenMempool.add(id);
-    const hex = await chain.rawTx(id).catch(() => null);
-    if (!hex) continue;
+    let hex: string;
+    try { hex = await chain.rawTx(id); }
+    catch (err) { if (err instanceof BtqRpcError && err.code === -5) continue; throw err; }
     const parsed = parseTx(hex);
-    const view: TxView = {
-      txid: computeTxid(parsed),
-      hex,
-      inputs: parsed.inputs.map((i) => ({ txid: i.txid, vout: i.vout })),
-      outputs: parsed.outputs.map((o, n) => ({ spk: bytesToHex(o.scriptPubKey), sats: o.valueSats, n })),
-    };
-    await processTx(view, null, tip.height, watch);
+    views.push({ txid: computeTxid(parsed), hex,
+      inputs: parsed.inputs.map(i => ({ txid: i.txid, vout: i.vout })),
+      outputs: parsed.outputs.map((o, n) => ({ spk: bytesToHex(o.scriptPubKey), sats: o.valueSats, n })) });
   }
-
-  // confirmations for locks first seen in the mempool
-  const confirming = await many<SwapRow>(db(), `SELECT * FROM swaps WHERE status = 'seller_lock_confirming'`);
-  for (const s of confirming) {
-    let height = s.btq_lock_height;
-    if (!height) {
-      const c = await chain.txConfirmations(s.btq_lock_txid!).catch(() => null);
-      height = c?.height ?? null;
-    }
-    await onBtqLockConfirmations(s.id, height, tip.height);
-  }
+  for (const view of views) { if (await processTx({ ...view, inputs: [] }, null, tip.height, watch)) watch = await loadWatch(); }
+  for (const view of views) { if (await processTx({ ...view, outputs: [] }, null, tip.height, watch)) watch = await loadWatch(); }
 
   await runDeadlines(tip.height);
   btqStatus.tip = tip.height;
@@ -135,22 +128,25 @@ export async function processLockHints(): Promise<void> {
   const hints = await many<{ swap_id: string; txid: string }>(
     db(),
     `SELECT e.swap_id, e.metadata->>'txid' AS txid FROM swap_events e JOIN swaps s ON s.id = e.swap_id
-      WHERE e.event_type = 'btq_lock_hint' AND s.status = 'awaiting_seller_lock' AND e.created_at > now() - interval '1 hour'`,
+      WHERE e.event_type = 'btq_lock_hint' AND s.btq_htlc_spk IS NOT NULL AND e.created_at > now() - interval '1 hour'`,
   );
   if (!hints.length) return;
   const chain = btqChain();
   const tip = (await chain.tip()).height;
   const watch = await loadWatch();
+  const mempool = new Set(await chain.mempoolTxids());
   for (const h of hints) {
     const hex = await chain.rawTx(h.txid).catch(() => null);
     if (!hex) continue;
     const parsed = parseTx(hex);
-    const conf = await chain.txConfirmations(h.txid).catch(() => null);
+    const conf = await confirmation(h.txid);
+    if (conf?.height === undefined && !mempool.has(h.txid)) continue;
     await processTx(
       { txid: h.txid, hex, inputs: [], outputs: parsed.outputs.map((o, n) => ({ spk: bytesToHex(o.scriptPubKey), sats: o.valueSats, n })) },
       conf?.height ?? null,
       tip,
       watch,
+      conf?.blockhash ?? null,
     );
   }
 }

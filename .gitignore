@@ -22,3 +22,6 @@ packages/solana-htlc/target/
 test-ledger/
 __pycache__/
 *.pyc
+
+playwright-report/
+test-results/

@@ -9,7 +9,7 @@ import {
 import {
   ASSOCIATED_TOKEN_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
-  createAssociatedTokenAccountInstruction,
+  createAssociatedTokenAccountIdempotentInstruction,
   getAssociatedTokenAddressSync,
 } from '@solana/spl-token';
 
@@ -43,7 +43,7 @@ export function htlcAddress(programId: PublicKey, id: Buffer): PublicKey {
 }
 
 export function parseSolHtlcState(data: Buffer): SolHtlcState | null {
-  if (data.length < SOL_HTLC_STATE_LEN || data[0] !== 1) return null;
+  if (data.length !== SOL_HTLC_STATE_LEN || (data[0] !== 1 && data[0] !== 2)) return null;
   return {
     partyA: new PublicKey(data.subarray(1, 33)),
     partyB: new PublicKey(data.subarray(33, 65)),
@@ -75,21 +75,21 @@ export async function buildHtlcTransaction(args: {
   secretHash: Buffer;
   deadline: bigint;
   preimage?: Buffer;
+  vaultAddress?: PublicKey;
 }): Promise<Transaction> {
   const id = agreementId(args.partyA, args.partyB, args.mint, args.amount, args.secretHash, args.deadline);
   const state = htlcAddress(args.programId, id);
   const source = getAssociatedTokenAddressSync(args.mint, args.partyA);
-  const vault = getAssociatedTokenAddressSync(args.mint, state, true);
+  const canonicalVault = getAssociatedTokenAddressSync(args.mint, state, true);
+  const vault = args.action === 'lock' ? canonicalVault : args.vaultAddress ?? canonicalVault;
   const sellerAta = getAssociatedTokenAddressSync(args.mint, args.partyB);
   const ixs: TransactionInstruction[] = [];
-  const missing = async (ata: PublicKey, owner: PublicKey) => {
-    if (!(await args.connection.getAccountInfo(ata))) {
-      ixs.push(createAssociatedTokenAccountInstruction(args.feePayer, ata, owner, args.mint, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID));
-    }
+  const ensureAta = (ata: PublicKey, owner: PublicKey) => {
+    ixs.push(createAssociatedTokenAccountIdempotentInstruction(args.feePayer, ata, owner, args.mint, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID));
   };
 
   if (args.action === 'lock') {
-    await missing(vault, state);
+    ensureAta(vault, state);
     const data = Buffer.concat([
       Buffer.from([0]),
       args.partyB.toBuffer(),
@@ -112,7 +112,7 @@ export async function buildHtlcTransaction(args: {
     }));
   } else if (args.action === 'withdraw') {
     if (!args.preimage || args.preimage.length !== 32) throw new Error('The withdraw needs the 32-byte preimage.');
-    await missing(sellerAta, args.partyB);
+    ensureAta(sellerAta, args.partyB);
     ixs.push(new TransactionInstruction({
       programId: args.programId,
       keys: [
@@ -121,15 +121,16 @@ export async function buildHtlcTransaction(args: {
         { pubkey: vault, isSigner: false, isWritable: true },
         { pubkey: sellerAta, isSigner: false, isWritable: true },
         { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+        { pubkey: args.partyA, isSigner: false, isWritable: true },
       ],
       data: Buffer.concat([Buffer.from([1]), args.preimage]),
     }));
   } else {
-    await missing(source, args.partyA);
+    ensureAta(source, args.partyA);
     ixs.push(new TransactionInstruction({
       programId: args.programId,
       keys: [
-        { pubkey: args.partyA, isSigner: true, isWritable: false },
+        { pubkey: args.partyA, isSigner: true, isWritable: true },
         { pubkey: state, isSigner: false, isWritable: true },
         { pubkey: vault, isSigner: false, isWritable: true },
         { pubkey: source, isSigner: false, isWritable: true },

@@ -1,10 +1,10 @@
-import { buildClaimTx, buildRefundTx, btqNetworkTag, swapBindingAsset } from '@btq-swap/htlc';
+import { buildClaimTx, buildRefundTx, btqNetworkTag, swapBindingAsset, claimRefusal, DEFAULT_CLAIM_MARGIN_BLOCKS, bytesToHex, btqToSats } from '@btq-swap/htlc';
 import { config } from '../config';
 import { btqChain } from '../chains/btq';
 import { evmChain } from '../chains/evm';
-import { buildHtlcTransaction } from '../chains/solana-htlc';
-import { platformSolanaKeypair, solanaMint, solanaProgramId, withSolana } from '../chains/solana';
-import { PublicKey } from '@solana/web3.js';
+import { prepareSolanaTransaction, submitSolanaTransaction } from '../domain/solana-transactions';
+import { platformSolanaKeypair } from '../chains/solana';
+import { Transaction } from '@solana/web3.js';
 import { decryptSecret } from '../lib/crypto';
 import { db, many, one } from '../lib/db';
 import { createLogger } from '../lib/logger';
@@ -16,6 +16,24 @@ import type { SwapRow } from '../domain/types';
 
 const log = createLogger('platform-agent');
 const MAX_ATTEMPTS = 5;
+class DeferredAction extends Error {}
+
+/** Read our node immediately before authorizing disclosure of the platform's secret. */
+export async function platformClaimRefusal(s: SwapRow): Promise<string | null> {
+  const btq = btqChain();
+  const [output, tip] = await Promise.all([
+    btq.rpc.call<{ bestblock: string; confirmations: number; value: number; scriptPubKey: { hex: string } } | null>(
+      'gettxout', [s.btq_lock_txid, s.btq_lock_vout, true]),
+    btq.tip(),
+  ]);
+  if (!output) return 'the funding output is missing or already spent';
+  if (output.bestblock !== tip.hash) return 'the chain changed while checking funding; retry next tick';
+  const htlc = htlcForSwap(s);
+  if (output.scriptPubKey?.hex?.toLowerCase() !== bytesToHex(htlc.scriptPubKey)) return 'the funding output has the wrong HTLC script';
+  if (!Number.isFinite(output.value) || btqToSats(output.value.toFixed(8)) !== BigInt(s.btq_lock_sats!)) return 'the funding output has the wrong value';
+  return claimRefusal({ lockConfirmations: output.confirmations, minConfirmations: config().BTQ_MIN_CONFIRMATIONS,
+    tipHeight: tip.height, refundLocktime: htlc.refundLocktime, marginBlocks: DEFAULT_CLAIM_MARGIN_BLOCKS });
+}
 
 async function attemptNo(swapId: string, kind: string): Promise<number> {
   const r = await one<{ n: string }>(
@@ -34,9 +52,19 @@ async function once(s: SwapRow, kind: string, fn: () => Promise<Record<string, u
   if (!(await claimAction(s.id, key, { kind, attempt }))) return;
   try {
     const meta = await fn();
+    if ((kind === 'evm_claim' || kind === 'evm_refund') && typeof meta.txHash === 'string') {
+      const column = kind === 'evm_claim' ? 'evm_pending_claim_tx' : 'evm_pending_refund_tx';
+      await db().query(`UPDATE swaps SET ${column} = $2 WHERE id = $1`, [s.id, meta.txHash]);
+    }
     await recordEvent(db(), s.id, `platform_${kind}`, meta, { actor: 'platform' });
     log.info(`swap #${s.short_id}: ${kind} done`, meta);
   } catch (err) {
+    if (err instanceof DeferredAction) {
+      // No transaction was signed or sent. Release only this attempt's reservation.
+      await db().query(`DELETE FROM swap_events WHERE action_key = $1 AND event_type = 'platform_action'`, [key]);
+      log.info(`swap #${s.short_id}: ${kind} deferred`, { reason: err.message });
+      return;
+    }
     log.error(`swap #${s.short_id}: ${kind} failed`, { err: (err as Error).message, attempt });
     await recordEvent(db(), s.id, 'platform_action_failed', { kind, attempt, error: (err as Error).message }, { actor: 'platform' });
   }
@@ -44,29 +72,11 @@ async function once(s: SwapRow, kind: string, fn: () => Promise<Record<string, u
 
 async function platformSolana(s: SwapRow, action: 'lock' | 'withdraw' | 'refund'): Promise<string> {
   const key = platformSolanaKeypair();
-  const deadline = action === 'lock'
-    ? BigInt(Math.floor(Date.now() / 1000) + config().SWAP_EVM_LOCK_DURATION_SEC)
-    : BigInt(Math.floor(new Date(s.evm_deadline!).getTime() / 1000));
-  const sig = await withSolana(async (connection) => {
-    const tx = await buildHtlcTransaction({
-      connection,
-      programId: solanaProgramId(),
-      mint: solanaMint(),
-      feePayer: key.publicKey,
-      action,
-      partyA: new PublicKey(s.buyer_sol!),
-      partyB: new PublicKey(s.seller_sol!),
-      amount: BigInt(s.amount_usdt_units),
-      secretHash: Buffer.from(s.secret_hash!, 'hex'),
-      deadline,
-      preimage: action === 'withdraw' ? Buffer.from(s.revealed_preimage!, 'hex') : undefined,
-    });
-    tx.partialSign(key);
-    const sent = await connection.sendRawTransaction(tx.serialize());
-    await connection.confirmTransaction(sent, 'confirmed');
-    return sent;
-  });
-  return sig;
+  const userId = action === 'withdraw' ? s.seller_user_id : s.buyer_user_id;
+  const prepared = await prepareSolanaTransaction(userId, s.id, action, s.secret_hash ?? undefined);
+  const transaction = Transaction.from(Buffer.from(prepared.tx, 'base64'));
+  if (!prepared.signed) transaction.partialSign(key);
+  return (await submitSolanaTransaction(userId, s.id, prepared.preparationId, transaction.serialize().toString('base64'))).signature;
 }
 
 export async function platformTick(tip: number): Promise<void> {
@@ -103,14 +113,34 @@ export async function platformTick(tip: number): Promise<void> {
           return { agreementId: r.agreementId, txHash: r.txHash };
         });
       } else if (!isBuyer && s.status === 'awaiting_seller_lock' && !s.btq_lock_txid && s.btq_htlc_address) {
+        const previous = await one<{ metadata: { txid?: string } }>(db(),
+          `SELECT metadata FROM swap_events WHERE swap_id = $1 AND event_type = 'platform_btq_lock' ORDER BY id DESC LIMIT 1`, [s.id]);
+        if (previous?.metadata.txid) {
+          const saved = await btq.platform.call<{ hex: string }>('gettransaction', [previous.metadata.txid]);
+          await btq.broadcast(saved.hex);
+          continue;
+        }
         await once(s, 'btq_lock', async () => {
           const txid = await btq.platformSend(s.btq_htlc_address!, BigInt(s.amount_sats), `swap ${s.short_id}`);
           return { txid, address: s.btq_htlc_address };
         });
-      } else if (isBuyer && s.status === 'awaiting_buyer_claim' && s.btq_lock_txid && !s.btq_claim_txid) {
+      } else if (isBuyer && (s.status === 'awaiting_buyer_claim' || (s.revealed_preimage && s.status === 'awaiting_seller_claim')) && s.btq_lock_txid && !s.btq_claim_txid && !s.btq_refund_txid) {
+        // Waiting for safe evidence is not a broadcast attempt and must not consume the action key.
+        const refusal = await platformClaimRefusal(s);
+        if (refusal) {
+          log.info(`swap #${s.short_id}: BTQ claim deferred`, { reason: refusal });
+          continue;
+        }
+        const dest = await btq.platformAddress('swap-claims');
         await once(s, 'btq_claim', async () => {
+          // Database and wallet RPC work above can cross the refund-height boundary.
+          try {
+            const refusal = await platformClaimRefusal(s);
+            if (refusal) throw new DeferredAction(refusal);
+          } catch (err) {
+            throw new DeferredAction((err as Error).message);
+          }
           const preimage = decryptSecret(s.platform_secret_enc!, config().PLATFORM_SECRET_KEY);
-          const dest = await btq.platformAddress('swap-claims');
           const signed = buildClaimTx({
             htlc: htlcForSwap(s),
             outpoint: { txid: s.btq_lock_txid!, vout: s.btq_lock_vout!, valueSats: BigInt(s.btq_lock_sats!) },
@@ -122,9 +152,9 @@ export async function platformTick(tip: number): Promise<void> {
           const txid = await btq.broadcast(signed.hex);
           return { txid, feeSats: signed.feeSats.toString(), to: dest };
         });
-      } else if (!isBuyer && s.status === 'awaiting_seller_claim' && s.revealed_preimage && s.evm_agreement_id && !s.evm_claim_tx && s.settlement_rail === 'solana') {
+      } else if (!isBuyer && s.revealed_preimage && s.evm_agreement_id && !s.evm_claim_tx && !s.evm_refund_tx && chainNow < Math.floor(s.evm_deadline!.getTime() / 1000) && s.settlement_rail === 'solana') {
         await once(s, 'solana_claim', async () => ({ signature: await platformSolana(s, 'withdraw') }));
-      } else if (!isBuyer && s.status === 'awaiting_seller_claim' && s.revealed_preimage && s.evm_agreement_id && !s.evm_claim_tx) {
+      } else if (!isBuyer && s.revealed_preimage && s.evm_agreement_id && !s.evm_claim_tx && !s.evm_refund_tx && chainNow < Math.floor(s.evm_deadline!.getTime() / 1000)) {
         await once(s, 'evm_claim', async () => ({ txHash: await evm.platformWithdraw(s.evm_agreement_id!, s.revealed_preimage!) }));
       } else if (!isBuyer && s.status === 'awaiting_refunds' && s.btq_lock_txid && !s.btq_claim_txid && !s.btq_refund_txid && tip >= (s.btq_refund_locktime ?? Infinity)) {
         await once(s, 'btq_refund', async () => {

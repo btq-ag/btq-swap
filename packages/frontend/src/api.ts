@@ -69,11 +69,15 @@ export interface SwapDetail {
   events: Array<{ id: string; event_type: string; from_status: string | null; to_status: string | null; actor: string; metadata: Record<string, unknown>; created_at: string }>;
 }
 
+export class ApiError extends Error {
+  constructor(message: string, readonly status: number) { super(message); }
+}
+
 export async function getJson<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`/api${path}`, { credentials: 'same-origin', ...init });
   const text = await res.text();
   const body = text ? JSON.parse(text) : {};
-  if (!res.ok) throw new Error(body.error ?? `${res.status} ${res.statusText}`);
+  if (!res.ok) throw new ApiError(body.error ?? `${res.status} ${res.statusText}`, res.status);
   return body as T;
 }
 

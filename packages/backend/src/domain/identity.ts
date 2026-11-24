@@ -13,6 +13,7 @@ import { randomToken } from '../lib/crypto';
 import { db, one, tx, type Queryable } from '../lib/db';
 import { writeAudit } from './audit';
 import { DomainError } from './errors';
+import { consumeChallenge, issueChallenge, type ChallengePurpose } from './challenges';
 import type { UserRow } from './types';
 
 const LINK_TTL_SEC = 15 * 60;
@@ -104,7 +105,7 @@ export function buildSiweMessage(p: { address: string; username: string; nonce: 
   ].join('\n');
 }
 
-export async function startEvmLink(user: UserRow, addressInput: string): Promise<{ message: string; address: string; expiresAt: Date }> {
+export async function startEvmLink(user: UserRow, addressInput: string, purpose: ChallengePurpose = 'identity'): Promise<{ challengeId: string; message: string; address: string; expiresAt: Date }> {
   let address: string;
   try {
     address = getAddress(addressInput.trim());
@@ -115,23 +116,20 @@ export async function startEvmLink(user: UserRow, addressInput: string): Promise
   const issuedAt = new Date();
   const expiresAt = new Date(issuedAt.getTime() + LINK_TTL_SEC * 1000);
   const message = buildSiweMessage({ address, username: user.discord_username ?? user.discord_id ?? user.id, nonce, issuedAt, expiresAt });
-  await db().query(
-    `INSERT INTO link_challenges (user_id, kind, challenge, message, expires_at) VALUES ($1, 'evm', $2, $3, $4)`,
-    [user.id, nonce, message, expiresAt],
-  );
-  return { message, address, expiresAt };
+  const challengeId = await issueChallenge({ user_id: user.id, kind: 'evm', challenge: nonce, message,
+    expires_at: expiresAt, purpose, target_address: address.toLowerCase() });
+  return { challengeId, message, address, expiresAt };
 }
 
-export async function finishEvmLink(user: UserRow, signature: string): Promise<UserRow> {
-  return tx(async (c) => {
-    const ch = await one<{ id: string; message: string; expires_at: Date; consumed_at: Date | null }>(
-      c,
-      `SELECT id, message, expires_at, consumed_at FROM link_challenges
-       WHERE user_id = $1 AND kind = 'evm' ORDER BY created_at DESC LIMIT 1 FOR UPDATE`,
-      [user.id],
-    );
-    if (!ch || ch.consumed_at) throw new DomainError('EXPIRED', 'No pending wallet link. Run `/swap link-evm` again.');
-    if (ch.expires_at.getTime() < Date.now()) throw new DomainError('EXPIRED', 'That link request expired. Run `/swap link-evm` again.');
+export async function finishEvmLink(user: UserRow, signature: string, challengeId: string,
+  options: { q?: Queryable; purpose?: ChallengePurpose } = {}): Promise<UserRow> {
+  const finish = async (c: Queryable) => {
+    const current = await one<UserRow>(c, 'SELECT * FROM users WHERE id = $1 FOR UPDATE', [user.id]);
+    if (!current) throw new DomainError('NOT_FOUND', 'Account not found.');
+    const ch = await consumeChallenge(c, challengeId, user.id, 'evm', options.purpose ?? 'identity');
+    if (options.purpose === 'desk_signin' && current.eth_address && current.eth_address.toLowerCase() !== ch.target_address) {
+      throw new DomainError('FORBIDDEN', 'That EVM wallet was replaced. Connect the wallet that is linked now.');
+    }
     const lines = ch.message.split('\n');
     if (!lines[0]?.startsWith(`${siweDomain()} wants you to sign in`)) throw new DomainError('VALIDATION', 'Link message domain mismatch.');
     const claimed = getAddress(lines[1]!.trim());
@@ -144,7 +142,6 @@ export async function finishEvmLink(user: UserRow, signature: string): Promise<U
     if (recovered !== claimed) throw new DomainError('VALIDATION', 'The signature was not made by the address in the message.');
     const taken = await one<{ id: string }>(c, 'SELECT id FROM users WHERE lower(eth_address) = lower($1) AND id <> $2', [claimed, user.id]);
     if (taken) throw new DomainError('CONFLICT', 'That wallet is already linked to another account.');
-    await c.query('UPDATE link_challenges SET consumed_at = now() WHERE id = $1', [ch.id]);
     const updated = await one<UserRow>(
       c,
       'UPDATE users SET eth_address = $2, eth_verified_at = now(), updated_at = now() WHERE id = $1 RETURNING *',
@@ -152,20 +149,19 @@ export async function finishEvmLink(user: UserRow, signature: string): Promise<U
     );
     await writeAudit(c, `user:${user.id}`, 'link.evm', user.id, { address: claimed });
     return updated!;
-  });
+  };
+  return options.q ? finish(options.q) : tx(finish);
 }
 
-export async function startBtqLink(user: UserRow): Promise<{ challenge: string; expiresAt: Date }> {
+export async function startBtqLink(user: UserRow, purpose: ChallengePurpose = 'identity'): Promise<{ challengeId: string; challenge: string; expiresAt: Date }> {
   const challenge = `btq-swap:${user.discord_id ?? user.id}:${randomToken(10)}`;
   const expiresAt = new Date(Date.now() + LINK_TTL_SEC * 1000);
-  await db().query(
-    `INSERT INTO link_challenges (user_id, kind, challenge, message, expires_at) VALUES ($1, 'btq', $2, $2, $3)`,
-    [user.id, challenge, expiresAt],
-  );
-  return { challenge, expiresAt };
+  const challengeId = await issueChallenge({ user_id: user.id, kind: 'btq', challenge, message: challenge,
+    expires_at: expiresAt, purpose, target_address: null });
+  return { challengeId, challenge, expiresAt };
 }
 
-export async function finishBtqLink(user: UserRow, input: { pubkey: string; signature: string; btqAddress: string }): Promise<UserRow> {
+export async function finishBtqLink(user: UserRow, input: { challengeId: string; pubkey: string; signature: string; btqAddress: string }): Promise<UserRow> {
   let pubkey: Uint8Array;
   let sig: Uint8Array;
   try {
@@ -182,21 +178,14 @@ export async function finishBtqLink(user: UserRow, input: { pubkey: string; sign
     throw new DomainError('VALIDATION', `BTQ address: ${(e as Error).message}`);
   }
   return tx(async (c) => {
-    const ch = await one<{ id: string; challenge: string; expires_at: Date; consumed_at: Date | null }>(
-      c,
-      `SELECT id, challenge, expires_at, consumed_at FROM link_challenges
-       WHERE user_id = $1 AND kind = 'btq' ORDER BY created_at DESC LIMIT 1 FOR UPDATE`,
-      [user.id],
-    );
-    if (!ch || ch.consumed_at) throw new DomainError('EXPIRED', 'No pending key link. Run `/swap link-btq` again.');
-    if (ch.expires_at.getTime() < Date.now()) throw new DomainError('EXPIRED', 'That key link expired. Run `/swap link-btq` again.');
+    await c.query('SELECT id FROM users WHERE id = $1 FOR UPDATE', [user.id]);
+    const ch = await consumeChallenge(c, input.challengeId, user.id, 'btq', 'identity');
     if (!verifySignature(pubkey, linkChallengeMessage(ch.challenge), sig)) {
       throw new DomainError('VALIDATION', 'The signature does not prove ownership of that swap key for this challenge.');
     }
     const pkHex = bytesToHex(pubkey);
     const taken = await one<{ id: string }>(c, 'SELECT id FROM users WHERE dilithium_pubkey = $1 AND id <> $2', [pkHex, user.id]);
     if (taken) throw new DomainError('CONFLICT', 'That swap key is already linked to another account.');
-    await c.query('UPDATE link_challenges SET consumed_at = now() WHERE id = $1', [ch.id]);
     const updated = await one<UserRow>(
       c,
       `UPDATE users SET dilithium_pubkey = $2, btq_address = $3, btq_pubkey_verified_at = now(), updated_at = now()

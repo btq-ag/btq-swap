@@ -94,29 +94,29 @@ export async function linkEvm(_i: BotInteraction, ctx: Ctx, r: Responder): Promi
 
 export async function evmAddressSubmitted(i: BotInteraction, ctx: Ctx, r: Responder): Promise<void> {
   const u = requireUser(ctx);
-  const { message, address } = await startEvmLink(u, i.fields!.getTextInputValue('address'));
+  const { message, address, challengeId } = await startEvmLink(u, i.fields!.getTextInputValue('address'));
   await r.reply({
     embeds: [{
       title: 'Sign this message with your wallet',
       color: COLOR.brand,
       description: `Sign the exact text below with \`${address}\` (MetaMask "personal_sign", or \`cast wallet sign\`), then press **Paste signature**. It expires in 15 minutes.\n` + '```\n' + message + '\n```',
     }],
-    components: [row(button('Paste signature', id('evm-sig', ctx)))],
+    components: [row(button('Paste signature', id('evm-sig', ctx, challengeId)))],
   });
 }
 
-export async function evmSigButton(_i: BotInteraction, ctx: Ctx, r: Responder): Promise<void> {
-  await r.modal(modal(id('evm-sigsubmit', ctx), 'EVM wallet signature', [textInput('signature', 'Signature (0x…)', { min_length: 130, max_length: 200 })]));
+export async function evmSigButton(_i: BotInteraction, ctx: Ctx, r: Responder, args: string[] = []): Promise<void> {
+  await r.modal(modal(id('evm-sigsubmit', ctx, args[0]), 'EVM wallet signature', [textInput('signature', 'Signature (0x…)', { min_length: 130, max_length: 200 })]));
 }
 
-export async function evmSigSubmitted(i: BotInteraction, ctx: Ctx, r: Responder): Promise<void> {
-  const u = await finishEvmLink(requireUser(ctx), i.fields!.getTextInputValue('signature'));
+export async function evmSigSubmitted(i: BotInteraction, ctx: Ctx, r: Responder, args: string[] = []): Promise<void> {
+  const u = await finishEvmLink(requireUser(ctx), i.fields!.getTextInputValue('signature'), args[0] ?? '');
   await r.reply({ embeds: [{ title: '✅ EVM wallet linked', description: `\`${u.eth_address}\``, color: COLOR.ok }] });
 }
 
 export async function linkBtq(_i: BotInteraction, ctx: Ctx, r: Responder): Promise<void> {
   const u = requireUser(ctx);
-  const { challenge } = await startBtqLink(u);
+  const { challenge, challengeId } = await startBtqLink(u);
   await r.reply({
     embeds: [{
       title: 'Link your BTQ swap key',
@@ -126,13 +126,13 @@ export async function linkBtq(_i: BotInteraction, ctx: Ctx, r: Responder): Promi
         code([`curl -fsSLO ${cliUrl()}`, 'node btq-htlc.mjs keygen', `node btq-htlc.mjs link ${challenge}`]) +
         '\nThen press **Submit key** and paste the `pubkey` and `signature`, plus the BTQ address where you want to receive coins.',
     }],
-    components: [row(button('Submit key', id('btq-key', ctx)))],
+    components: [row(button('Submit key', id('btq-key', ctx, challengeId)))],
   });
 }
 
-export async function btqKeyButton(_i: BotInteraction, ctx: Ctx, r: Responder): Promise<void> {
+export async function btqKeyButton(_i: BotInteraction, ctx: Ctx, r: Responder, args: string[] = []): Promise<void> {
   await r.modal(
-    modal(id('btq-keysubmit', ctx), 'BTQ swap key', [
+    modal(id('btq-keysubmit', ctx, args[0]), 'BTQ swap key', [
       textInput('pubkey', 'pubkey (base64)', { style: 2, min_length: 1700, max_length: 4000 }),
       textInput('signature', 'signature (base64)', { style: 2, min_length: 3000, max_length: 4000 }),
       textInput('address', `BTQ receive address (${config().BTQ_NETWORK})`, { min_length: 20, max_length: 120 }),
@@ -140,8 +140,9 @@ export async function btqKeyButton(_i: BotInteraction, ctx: Ctx, r: Responder): 
   );
 }
 
-export async function btqKeySubmitted(i: BotInteraction, ctx: Ctx, r: Responder): Promise<void> {
+export async function btqKeySubmitted(i: BotInteraction, ctx: Ctx, r: Responder, args: string[] = []): Promise<void> {
   const u = await finishBtqLink(requireUser(ctx), {
+    challengeId: args[0] ?? '',
     pubkey: i.fields!.getTextInputValue('pubkey'),
     signature: i.fields!.getTextInputValue('signature'),
     btqAddress: i.fields!.getTextInputValue('address'),

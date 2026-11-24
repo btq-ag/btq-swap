@@ -27,4 +27,7 @@ describe('claimRefusal', () => {
     expect(claimRefusal({ ...base, tipHeight: 172 })).not.toBeNull();
     expect(claimRefusal({ ...base, tipHeight: 500 })).not.toBeNull();
   });
+  it.each(['lockConfirmations', 'minConfirmations', 'marginBlocks', 'refundLocktime'] as const)('fails closed for invalid %s', key => {
+    for (const value of [NaN, Infinity, -1, 0.5]) expect(claimRefusal({ ...base, [key]: value })).not.toBeNull();
+  });
 });

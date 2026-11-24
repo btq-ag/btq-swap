@@ -10,12 +10,14 @@ import {
   sha256Bytes,
   UUID_RE,
   type HtlcDescriptor,
+  toRecord,
 } from '@btq-swap/htlc';
 import { config, sellerTimeBudgetSec } from '../config';
 import { encryptSecret } from '../lib/crypto';
 import { db, many, one, tx, type Queryable } from '../lib/db';
 import { createLogger } from '../lib/logger';
 import { DomainError } from './errors';
+import { hashOwnerConflict, rememberLock } from './funding';
 import { getSettings } from './settings';
 import { instructionFor, usdtDisplay } from './instructions';
 import { fromUnits, usdtUnitsFor } from './money';
@@ -75,7 +77,7 @@ async function notifyStatus(c: Queryable, s: SwapRow): Promise<void> {
       userId,
       swapId: s.id,
       kind,
-      dedupeKey: `${kind}:${s.id}:${userId}:${s.status}`,
+      dedupeKey: `${kind}:${s.id}:${userId}:${s.status}:${s.state_revision}`,
       payload: {
         title: `Swap #${s.short_id} — ${STATUS_LABEL[s.status]}`,
         body: `${ins.actionable ? '**Your move:** ' : ''}${ins.headline}\n${ins.detail}`,
@@ -103,14 +105,14 @@ export async function transition(
 ): Promise<SwapRow | null> {
   const cur = await lockSwap(c, swapId);
   if (!cur || !from.includes(cur.status)) return null;
-  const sets = ['status = $2', 'updated_at = now()'];
+  const sets = ['status = $2', 'updated_at = now()', 'state_revision = state_revision + 1'];
   const vals: unknown[] = [swapId, to];
   for (const [k, v] of Object.entries(updates)) {
     if (!/^[a-z_]+$/.test(k)) throw new Error(`bad column ${k}`);
     vals.push(v);
     sets.push(`${k} = $${vals.length}`);
   }
-  if (TERMINAL_STATUSES.includes(to)) sets.push('completed_at = now()');
+  sets.push(TERMINAL_STATUSES.includes(to) ? 'completed_at = now()' : 'completed_at = NULL');
   const updated = await one<SwapRow>(c, `UPDATE swaps SET ${sets.join(', ')} WHERE id = $1 RETURNING *`, vals);
   await recordEvent(c, swapId, eventType, metadata, { from: cur.status, to, actor });
   if (updated && cur.status !== to) await notifyStatus(c, updated);
@@ -127,6 +129,29 @@ async function patch(c: Queryable, swapId: string, updates: Record<string, unkno
     sets.push(`${k} = $${vals.length}`);
   }
   return one<SwapRow>(c, `UPDATE swaps SET ${sets.join(', ')} WHERE id = $1 RETURNING *`, vals);
+}
+
+/** Recompute settlement from surviving evidence instead of restoring a stale cross-chain status snapshot. */
+async function reconcileEvidence(c: Queryable, s: SwapRow, updates: Record<string, unknown>, event: string, btqTip?: number): Promise<void> {
+  const next = { ...s, ...updates } as SwapRow;
+  const refundOpen = next.btq_refund_locktime !== null && (btqTip ?? await currentBtqTip()) >= next.btq_refund_locktime;
+  let status: SwapStatus;
+  if (next.evm_claim_tx && next.btq_claim_txid) status = 'completed';
+  else if ((next.evm_refund_tx && next.btq_claim_txid) || (next.evm_claim_tx && next.btq_refund_txid)) status = 'failed';
+  else if (next.evm_refund_tx && (!next.btq_lock_txid || next.btq_refund_txid)) status = 'refunded';
+  else if (next.revealed_preimage && !next.evm_claim_tx && !next.evm_refund_tx && !next.btq_refund_txid && (!refundOpen || !!next.btq_claim_txid) && next.evm_deadline && next.evm_deadline.getTime() > Date.now()) status = 'awaiting_seller_claim';
+  else if (next.btq_refund_txid || next.evm_refund_tx || refundOpen || (!next.evm_claim_tx && next.evm_deadline && next.evm_deadline.getTime() <= Date.now())) status = 'awaiting_refunds';
+  else if (next.revealed_preimage) status = 'awaiting_seller_claim';
+  else if (next.evm_lock_confs < config().EVM_MIN_CONFIRMATIONS) status = next.evm_deadline && next.evm_deadline.getTime() - (sellerTimeBudgetSec() + 30) * 1000 <= Date.now() ? (next.btq_lock_txid ? 'awaiting_refunds' : 'awaiting_buyer_refund') : 'buyer_lock_confirming';
+  else if (next.btq_lock_txid) status = next.btq_lock_confs >= config().BTQ_MIN_CONFIRMATIONS ? 'awaiting_buyer_claim' : 'seller_lock_confirming';
+  else status = next.seller_lock_by && next.seller_lock_by.getTime() <= Date.now() ? 'awaiting_buyer_refund' : 'awaiting_seller_lock';
+  if (status === s.status) await patch(c, s.id, updates);
+  else await transition(c, s.id, [s.status], status, event, { ...updates, failure_reason: status === 'failed' ? 'the two chains settled different outcomes' : null });
+}
+
+async function releaseRecoveryAction(c: Queryable, s: SwapRow, kind: string): Promise<void> {
+  // Keep the audit record, but permit a new attempt after a previously observed transaction disappears.
+  await c.query(`UPDATE swap_events SET action_key = NULL WHERE swap_id = $1 AND event_type = 'platform_action' AND metadata->>'kind' = $2`, [s.id, kind]);
 }
 
 // ─────────────────────────── match → swap ───────────────────────────
@@ -208,6 +233,8 @@ export interface LockupObservation {
   agreementId: string;
   txHash: string;
   blockNumber: number;
+  blockHash?: string;
+  blockTimestamp?: number;
   partyA: string;
   partyB: string;
   secretlock: string;
@@ -244,41 +271,40 @@ export async function onEvmLockup(ev: LockupObservation, headBlock: number, nowS
   await tx(async (c) => {
     const s = await lockSwap(c, swapId);
     if (!s) return;
-    if (s.evm_agreement_id) {
-      if (s.evm_agreement_id !== ev.agreementId.toLowerCase()) {
-        await recordEvent(c, s.id, 'evm_lock_ignored', { reason: 'swap already has a lock', agreementId: ev.agreementId, txHash: ev.txHash });
-      }
+    if (s.settlement_rail !== 'evm') return;
+    if (s.evm_agreement_id === ev.agreementId.toLowerCase()) {
+      const updated = await patch(c, s.id, { evm_lock_tx: ev.txHash, evm_lock_block: ev.blockNumber,
+        evm_lock_block_hash: ev.blockHash ?? null, evm_lock_confs: Math.max(0, headBlock - ev.blockNumber + 1) });
+      if (updated!.status === 'buyer_lock_confirming' && updated!.evm_lock_confs >= config().EVM_MIN_CONFIRMATIONS) await enterAwaitingSellerLock(c, updated!, null);
       return;
     }
-    if (s.status !== 'awaiting_buyer_lock') {
-      await recordEvent(c, s.id, 'evm_lock_ignored', { reason: `swap is ${s.status}`, agreementId: ev.agreementId, txHash: ev.txHash });
-      await enqueueNotification(c, {
-        userId: s.buyer_user_id,
-        swapId: s.id,
-        kind: 'info',
-        dedupeKey: `late_lock:${ev.agreementId}`,
-        payload: { title: `Swap #${s.short_id}: lock not accepted`, body: `Your USDT lock arrived while the swap was ${STATUS_LABEL[s.status]}. Refund it after its deadline with \`btq-htlc evm refund\`.` },
-      });
-      return;
-    }
-    const problem = validateLockup(s, ev, nowSec);
+    const timely = (ev.blockTimestamp ?? nowSec) * 1000 <= s.buyer_lock_by.getTime();
+    let problem = s.evm_agreement_id ? 'swap already has a lock' :
+      !timely ? 'buyer lock window has closed' :
+      !['awaiting_buyer_lock', 'expired'].includes(s.status) ? `swap is ${s.status}` : validateLockup(s, ev, nowSec);
+    // An underpaid/rejected escrow can still disclose its preimage. Never reuse its hash for a new lock.
+    // Only the bound buyer can reserve this swap's hash; an outsider's mislabeled transfer cannot claim it.
+    if (ev.partyA.toLowerCase() === s.buyer_eth.toLowerCase() && await hashOwnerConflict(c, ev.secretlock.slice(2), s, ev.agreementId)) problem = 'secret hash was already used by another lock';
+    // Keep the typed recovery fields; arbitrary on-chain labels can contain text PostgreSQL rejects.
+    await rememberLock(c, s, 'evm', ev.agreementId, { agreementId: ev.agreementId, txHash: ev.txHash,
+      blockNumber: ev.blockNumber, partyA: ev.partyA, partyB: ev.partyB, erc20Contract: ev.erc20Contract,
+      secretHash: ev.secretlock, deadline: ev.deadline, tokenAmount: ev.tokenAmount.toString() }, problem);
     if (problem) {
-      await recordEvent(c, s.id, 'evm_lock_rejected', { reason: problem, agreementId: ev.agreementId, txHash: ev.txHash });
-      await enqueueNotification(c, {
-        userId: s.buyer_user_id,
-        swapId: s.id,
-        kind: 'info',
-        dedupeKey: `rejected_lock:${ev.agreementId}`,
-        payload: { title: `Swap #${s.short_id}: USDT lock rejected`, body: `Reason: ${problem}. Refund that lock after its deadline; you can still lock correctly before the swap window closes.` },
+      const fresh = await recordEvent(c, s.id, 'evm_lock_rejected', { reason: problem, agreementId: ev.agreementId, txHash: ev.txHash }, { actionKey: `rejected_evm:${s.id}:${ev.agreementId}` });
+      if (fresh) await enqueueNotification(c, {
+        userId: s.buyer_user_id, swapId: s.id, kind: 'info', dedupeKey: `rejected_lock:${ev.agreementId}`,
+        payload: { title: `Swap #${s.short_id}: USDT lock rejected`, body: `Reason: ${problem}. Refund after its deadline with \`btq-htlc evm refund --swap ${s.short_id} --agreement-id ${ev.agreementId}\`.` },
       });
       return;
     }
     const confs = Math.max(0, headBlock - ev.blockNumber + 1);
-    const updated = await transition(c, s.id, ['awaiting_buyer_lock'], 'buyer_lock_confirming', 'evm_locked', {
+    if (s.status === 'expired') await c.query('UPDATE users SET no_show_count = GREATEST(0, no_show_count - 1) WHERE id = $1', [s.buyer_user_id]);
+    const updated = await transition(c, s.id, ['awaiting_buyer_lock', 'expired'], 'buyer_lock_confirming', 'evm_locked', {
       secret_hash: ev.secretlock.slice(2),
       evm_agreement_id: ev.agreementId.toLowerCase(),
       evm_lock_tx: ev.txHash,
       evm_lock_block: ev.blockNumber,
+      evm_lock_block_hash: ev.blockHash ?? null,
       evm_deadline: new Date(ev.deadline * 1000),
       evm_lock_confs: confs,
     }, { agreementId: ev.agreementId, txHash: ev.txHash, deadline: ev.deadline, amount: ev.tokenAmount.toString() });
@@ -298,6 +324,8 @@ export interface SolanaLockObservation {
   preimageHex: string;
   agreementHex: string;
   signature: string | null;
+  lockTime: number;
+  settlementSignature: string | null;
 }
 
 /**
@@ -315,51 +343,44 @@ export function validateSolanaLock(s: Pick<SwapRow, 'amount_usdt_units' | 'secre
   return null;
 }
 
-export async function observeSolanaAccount(input: SolanaLockObservation): Promise<void> {
-  const nowSec = Math.floor(Date.now() / 1000);
-  await tx(async (c) => {
-    const s = await one<SwapRow>(
-      c,
-      `SELECT * FROM swaps
-        WHERE settlement_rail = 'solana' AND buyer_sol = $1 AND seller_sol = $2 AND evm_token = $3
-          AND (evm_agreement_id = $4 OR (evm_agreement_id IS NULL AND status = 'awaiting_buyer_lock'))
-        ORDER BY CASE WHEN evm_agreement_id = $4 THEN 0 WHEN amount_usdt_units = $5 THEN 1 ELSE 2 END, created_at
-        LIMIT 1 FOR UPDATE`,
-      [input.partyA, input.partyB, input.mint, input.agreementHex, input.amount.toString()],
-    );
-    if (!s || s.evm_agreement_id) return;
-    if (s.status !== 'awaiting_buyer_lock' || input.refunded) return;
-    const problem = validateSolanaLock(s, input, nowSec);
-    if (problem) {
-      // The watcher sees this account every tick: record and notify once per agreement.
-      const fresh = await recordEvent(c, s.id, 'solana_lock_rejected', { reason: problem, agreementId: input.agreementHex }, { actionKey: `solana_lock_rejected:${input.agreementHex}` });
-      if (fresh) {
-        await enqueueNotification(c, {
-          userId: s.buyer_user_id,
-          swapId: s.id,
-          kind: 'info',
-          dedupeKey: `rejected_lock:${input.agreementHex}`,
-          payload: { title: `Swap #${s.short_id}: Solana lock rejected`, body: `Reason: ${problem}. Refund that lock after its deadline; you can still lock correctly before the swap window closes.` },
-        });
+export async function observeSolanaAccount(swapId: string, input: SolanaLockObservation, q?: Queryable): Promise<void> {
+  const apply = async (c: Queryable) => {
+    const s = await lockSwap(c, swapId);
+    if (!s || s.settlement_rail !== 'solana' || s.buyer_sol !== input.partyA || s.seller_sol !== input.partyB || s.evm_token !== input.mint) return;
+    if (s.evm_agreement_id && s.evm_agreement_id !== input.agreementHex) return;
+    const updates: Record<string, unknown> = { secret_hash: input.secretHashHex, evm_agreement_id: input.agreementHex,
+      evm_lock_tx: input.signature, evm_deadline: new Date(input.deadline * 1000), evm_lock_confs: config().EVM_MIN_CONFIRMATIONS };
+    if (!s.evm_agreement_id) {
+      let problem = validateSolanaLock(s, input, input.lockTime);
+      if (input.lockTime * 1000 > s.buyer_lock_by.getTime()) problem = 'buyer lock window has closed';
+      if (await hashOwnerConflict(c, input.secretHashHex, s, input.agreementHex)) {
+        await rememberLock(c, s, 'solana', input.agreementHex, { ...input, amount: input.amount.toString() }, 'secret hash was already used by another lock');
+        await recordEvent(c, s.id, 'solana_lock_rejected', { agreementId: input.agreementHex, reason: 'secret hash was already used by another lock' }, { actionKey: `solana_rejected:${s.id}:${input.agreementHex}` });
+        return;
       }
-      return;
+      await rememberLock(c, s, 'solana', input.agreementHex, { ...input, amount: input.amount.toString() }, problem);
+      // Even an expired/rejected escrow remains bound and recoverable by its buyer.
+      if (problem) updates.failure_reason = problem;
+      if (input.refunded || input.withdrawn) {
+        // Apply both finalized legs atomically: never ask for BTQ funding for a historical spent escrow.
+      } else if (problem || input.deadline * 1000 - (sellerTimeBudgetSec() + 30) * 1000 <= Date.now()) {
+        await transition(c, s.id, [s.status], 'awaiting_buyer_refund', 'solana_lock_rejected', updates); return;
+      } else {
+        if (s.status === 'expired') await c.query('UPDATE users SET no_show_count=GREATEST(0,no_show_count-1) WHERE id=$1',[s.buyer_user_id]);
+        const updated = await transition(c, s.id, [s.status], 'buyer_lock_confirming', 'solana_locked', updates);
+        if (updated) await enterAwaitingSellerLock(c, updated, null);
+        return;
+      }
     }
-    const updated = await transition(c, s.id, ['awaiting_buyer_lock'], 'buyer_lock_confirming', 'solana_locked', {
-      secret_hash: input.secretHashHex,
-      evm_agreement_id: input.agreementHex,
-      evm_lock_tx: input.signature,
-      evm_deadline: new Date(input.deadline * 1000),
-      evm_lock_confs: config().EVM_MIN_CONFIRMATIONS,
-    }, { agreementId: input.agreementHex, signature: input.signature, amount: input.amount.toString() });
-    if (updated) await enterAwaitingSellerLock(c, updated, null);
-  });
-  if (input.withdrawn && input.preimageHex && !/^0+$/.test(input.preimageHex)) {
-    await onEvmClaimed(input.agreementHex, input.signature ?? input.agreementHex, input.preimageHex);
-  }
-  if (input.refunded) await onEvmRefunded(input.agreementHex, input.signature ?? input.agreementHex);
+    if (!input.withdrawn && !input.refunded) { await patch(c, s.id, updates); return; }
+    if (input.withdrawn && input.settlementSignature && /^[0-9a-f]{64}$/.test(input.preimageHex) && bytesToHex(sha256Bytes(hexToBytes(input.preimageHex))) === input.secretHashHex) {
+      updates.evm_claim_tx = input.settlementSignature; updates.revealed_preimage = s.revealed_preimage ?? input.preimageHex;
+    } else if (input.refunded && input.settlementSignature) updates.evm_refund_tx = input.settlementSignature;
+    await reconcileEvidence(c, s, updates, input.withdrawn ? 'solana_claimed' : input.refunded ? 'solana_refunded' : 'solana_lock_observed');
+  };
+  if (q) await apply(q); else await tx(apply);
 }
 
-/** Called each tick for buyer_lock_confirming swaps. */
 export async function onEvmLockConfirmations(swapId: string, confs: number, btqTip: number): Promise<void> {
   await tx(async (c) => {
     const s = await lockSwap(c, swapId);
@@ -370,6 +391,7 @@ export async function onEvmLockConfirmations(swapId: string, confs: number, btqT
 }
 
 async function enterAwaitingSellerLock(c: Queryable, s: SwapRow, btqTip: number | null): Promise<void> {
+  if (s.btq_htlc_spk) { await reconcileEvidence(c, s, {}, 'evm_lock_reconfirmed'); return; }
   const tip = btqTip ?? (await currentBtqTip());
   const deadlineMs = s.evm_deadline!.getTime();
   const sellerBy = Math.min(Date.now() + config().SWAP_SELLER_LOCK_WINDOW_SEC * 1000, deadlineMs - sellerTimeBudgetSec() * 1000);
@@ -397,132 +419,133 @@ async function currentBtqTip(): Promise<number> {
   return tipProvider();
 }
 
-export async function onEvmClaimed(agreementId: string, txHash: string, key: string): Promise<void> {
-  await tx(async (c) => {
+export async function onEvmClaimed(agreementId: string, txHash: string, key: string, block?: { height: number; hash: string }): Promise<void> {
+  await tx(async c => {
     const s = await one<SwapRow>(c, 'SELECT * FROM swaps WHERE evm_agreement_id = $1 FOR UPDATE', [agreementId.toLowerCase()]);
-    if (!s || s.evm_claim_tx) return;
+    if (!s) return;
     const keyHex = key.replace(/^0x/, '').toLowerCase();
-    if (!s.secret_hash || bytesToHex(sha256Bytes(hexToBytes(keyHex))) !== s.secret_hash) {
-      await recordEvent(c, s.id, 'evm_claim_mismatch', { txHash });
-      return;
+    if (!/^[0-9a-f]{64}$/.test(keyHex) || bytesToHex(sha256Bytes(hexToBytes(keyHex))) !== s.secret_hash) {
+      await recordEvent(c, s.id, 'evm_claim_mismatch', { txHash }); return;
     }
-    const from = s.status;
-    if (TERMINAL_STATUSES.includes(from)) {
-      await patch(c, s.id, { evm_claim_tx: txHash });
-      await recordEvent(c, s.id, 'evm_claimed_late', { txHash });
-      return;
-    }
-    await transition(c, s.id, [from], 'completed', 'evm_claimed', { evm_claim_tx: txHash, revealed_preimage: s.revealed_preimage ?? keyHex }, { txHash });
+    await reconcileEvidence(c, s, { evm_claim_tx: txHash, evm_claim_block: block?.height ?? null,
+      evm_claim_block_hash: block?.hash ?? null, evm_pending_claim_tx: null, revealed_preimage: s.revealed_preimage ?? keyHex }, 'evm_claimed');
   });
 }
 
-export async function onEvmRefunded(agreementId: string, txHash: string): Promise<void> {
-  await tx(async (c) => {
+export async function onEvmRefunded(agreementId: string, txHash: string, block?: { height: number; hash: string }): Promise<void> {
+  await tx(async c => {
     const s = await one<SwapRow>(c, 'SELECT * FROM swaps WHERE evm_agreement_id = $1 FOR UPDATE', [agreementId.toLowerCase()]);
-    if (!s || s.evm_refund_tx) return;
-    const updates = { evm_refund_tx: txHash };
-    switch (s.status) {
-      case 'awaiting_buyer_refund':
-      case 'buyer_lock_confirming':
-      case 'awaiting_seller_lock':
-        await transition(c, s.id, [s.status], 'refunded', 'evm_refunded', updates, { txHash });
-        return;
-      case 'awaiting_refunds':
-        if (!s.btq_lock_txid || s.btq_refund_txid) await transition(c, s.id, ['awaiting_refunds'], 'refunded', 'evm_refunded', updates, { txHash });
-        else {
-          await patch(c, s.id, updates);
-          await recordEvent(c, s.id, 'evm_refunded', { txHash });
-        }
-        return;
-      case 'awaiting_seller_claim':
-        await transition(c, s.id, ['awaiting_seller_claim'], 'failed', 'evm_refunded_before_seller_claim', { ...updates, failure_reason: 'seller did not withdraw USDT before the deadline' }, { txHash });
-        return;
-      default:
-        await patch(c, s.id, updates);
-        await recordEvent(c, s.id, 'evm_refunded', { txHash, status: s.status });
+    if (!s) return;
+    await reconcileEvidence(c, s, { evm_refund_tx: txHash, evm_refund_block: block?.height ?? null,
+      evm_refund_block_hash: block?.hash ?? null, evm_pending_refund_tx: null }, 'evm_refunded');
+  });
+}
+
+export async function onPendingEvmSpend(agreementId: string, kind: 'claim' | 'refund', txid: string, preimage?: string): Promise<void> {
+  await tx(async c => {
+    const s = await one<SwapRow>(c, 'SELECT * FROM swaps WHERE evm_agreement_id = $1 FOR UPDATE', [agreementId.toLowerCase()]);
+    if (!s || s.settlement_rail !== 'evm' || s[`evm_${kind}_tx`]) return;
+    const updates: Record<string, unknown> = { [`evm_pending_${kind}_tx`]: txid };
+    const key = preimage?.replace(/^0x/, '').toLowerCase();
+    if (key && /^[0-9a-f]{64}$/.test(key) && bytesToHex(sha256Bytes(hexToBytes(key))) === s.secret_hash) updates.revealed_preimage = s.revealed_preimage ?? key;
+    await reconcileEvidence(c, s, updates, `evm_${kind}_pending`);
+  });
+}
+
+/** An accepted agreement stays bound for recovery, but no action may rely on its orphaned confirmations. */
+export async function reconcileEvmObservation(swapId: string, leg: 'lock' | 'claim' | 'refund', block: { height: number; hash: string; confirmations: number } | null): Promise<void> {
+  await tx(async c => {
+    const s = await lockSwap(c, swapId); if (!s || s.settlement_rail !== 'evm') return;
+    if (leg === 'lock') {
+      const updates = { evm_lock_block: block?.height ?? null, evm_lock_block_hash: block?.hash ?? null, evm_lock_confs: block?.confirmations ?? 0 };
+      if (!block || block.confirmations < config().EVM_MIN_CONFIRMATIONS) await reconcileEvidence(c, s, updates, 'evm_lock_orphaned');
+      else {
+        const updated = await patch(c, s.id, updates);
+        if (updated!.status === 'buyer_lock_confirming') await enterAwaitingSellerLock(c, updated!, null);
+      }
+    } else if (!block || block.confirmations < config().EVM_MIN_CONFIRMATIONS) {
+      if (!block) await releaseRecoveryAction(c, s, `evm_${leg}`);
+      await reconcileEvidence(c, s, { [`evm_${leg}_tx`]: null, [`evm_pending_${leg}_tx`]: s[`evm_${leg}_tx`] ?? s[`evm_pending_${leg}_tx`], [`evm_${leg}_block`]: null, [`evm_${leg}_block_hash`]: null }, `evm_${leg}_orphaned`);
+    } else {
+      await patch(c, s.id, { [`evm_${leg}_block`]: block.height, [`evm_${leg}_block_hash`]: block.hash });
     }
   });
 }
 
 // ─────────────────────────── BTQ leg ───────────────────────────
 
-export async function onBtqLockOutput(swapId: string, o: { txid: string; vout: number; sats: bigint; height: number | null }, tip: number): Promise<void> {
+export async function onBtqLockOutput(swapId: string, o: { txid: string; vout: number; sats: bigint; height: number | null; blockHash?: string | null }, tip: number): Promise<void> {
   await tx(async (c) => {
     const s = await lockSwap(c, swapId);
     if (!s) return;
-    if (s.btq_lock_txid) {
-      if (s.btq_lock_txid === o.txid && s.btq_lock_vout === o.vout && o.height && !s.btq_lock_height) {
-        await patch(c, s.id, { btq_lock_height: o.height });
-      }
+    if (s.btq_lock_txid === o.txid && s.btq_lock_vout === o.vout) {
+      await reconcileEvidence(c, s, { btq_lock_height: o.blockHash ? o.height : null, btq_lock_block_hash: o.blockHash ?? null,
+        btq_lock_confs: o.height !== null && o.blockHash ? Math.max(0, tip - o.height + 1) : 0 }, 'btq_lock_confirmations', tip);
       return;
     }
-    if (s.status !== 'awaiting_seller_lock') {
-      await recordEvent(c, s.id, 'btq_lock_ignored', { reason: `swap is ${s.status}`, txid: o.txid, vout: o.vout });
-      await enqueueNotification(c, {
-        userId: s.seller_user_id,
-        swapId: s.id,
-        kind: 'info',
-        dedupeKey: `late_btq:${o.txid}:${o.vout}`,
-        payload: { title: `Swap #${s.short_id}: BTQ lock not accepted`, body: `Your BTQ arrived while the swap was ${STATUS_LABEL[s.status]}. Refund it after block ${s.btq_refund_locktime} with \`btq-htlc refund\`.` },
+    const previous = await one(c, `SELECT 1 FROM swap_locks WHERE chain = 'btq' AND network = $1 AND lock_id = $2 AND swap_id = $3 AND (reason IS NULL OR metadata->>'accepted' = 'true')`, [s.btq_network, `${o.txid}:${o.vout}`, s.id]);
+    let problem = s.btq_lock_txid ? 'swap already has a BTQ lock' : s.status !== 'awaiting_seller_lock' && !previous && !s.revealed_preimage ? `swap is ${s.status}` :
+      o.sats < BigInt(s.amount_sats) ? `amount ${o.sats} < ${s.amount_sats}` : null;
+    const owned = await rememberLock(c, s, 'btq', `${o.txid}:${o.vout}`, {
+      txid: o.txid, vout: o.vout, valueSats: o.sats.toString(), htlc: toRecord(htlcForSwap(s)),
+    }, problem);
+    if (!owned) problem = 'funding output belongs to another swap';
+    if (problem) {
+      const fresh = await recordEvent(c, s.id, 'btq_lock_rejected', { reason: problem, txid: o.txid, vout: o.vout }, { actionKey: `rejected_btq:${s.id}:${o.txid}:${o.vout}` });
+      if (fresh && owned) await enqueueNotification(c, {
+        userId: s.seller_user_id, swapId: s.id, kind: 'info', dedupeKey: `rejected_btq:${o.txid}:${o.vout}`,
+        payload: { title: `Swap #${s.short_id}: BTQ lock not accepted`, body: `Reason: ${problem}. Refund after block ${s.btq_refund_locktime} with \`btq-htlc refund --swap ${s.short_id} --outpoint ${o.txid}:${o.vout} --rpc <your-node>\`.` },
       });
       return;
     }
-    if (o.sats < BigInt(s.amount_sats)) {
-      await recordEvent(c, s.id, 'btq_lock_rejected', { reason: `amount ${o.sats} < ${s.amount_sats}`, txid: o.txid, vout: o.vout });
-      return;
-    }
-    const confs = o.height ? tip - o.height + 1 : 0;
-    const updated = await transition(c, s.id, ['awaiting_seller_lock'], 'seller_lock_confirming', 'btq_locked', {
+    const confs = o.height !== null && o.blockHash ? Math.max(0, tip - o.height + 1) : 0;
+    const updated = await transition(c, s.id, [s.status], 'seller_lock_confirming', 'btq_locked', {
       btq_lock_txid: o.txid,
       btq_lock_vout: o.vout,
       btq_lock_sats: o.sats.toString(),
-      btq_lock_height: o.height,
+      btq_lock_height: o.blockHash ? o.height : null,
+      btq_lock_block_hash: o.blockHash ?? null,
       btq_lock_confs: Math.max(0, confs),
     }, { txid: o.txid, vout: o.vout, sats: o.sats.toString() });
-    if (updated && confs >= config().BTQ_MIN_CONFIRMATIONS) {
-      await transition(c, s.id, ['seller_lock_confirming'], 'awaiting_buyer_claim', 'btq_lock_confirmed', { btq_lock_confs: confs }, { confs });
-    }
+    if (updated) await reconcileEvidence(c, updated, {}, 'btq_lock_confirmed', tip);
   });
 }
 
-export async function onBtqLockConfirmations(swapId: string, height: number | null, tip: number): Promise<void> {
-  await tx(async (c) => {
-    const s = await lockSwap(c, swapId);
-    if (!s || s.status !== 'seller_lock_confirming') return;
-    const h = height ?? s.btq_lock_height;
-    const confs = h ? tip - h + 1 : 0;
-    if (h !== s.btq_lock_height || confs !== s.btq_lock_confs) await patch(c, s.id, { btq_lock_height: h, btq_lock_confs: Math.max(0, confs) });
-    if (confs >= config().BTQ_MIN_CONFIRMATIONS) {
-      await transition(c, s.id, ['seller_lock_confirming'], 'awaiting_buyer_claim', 'btq_lock_confirmed', { btq_lock_confs: confs }, { confs });
-    }
+export async function onBtqLockConfirmations(swapId: string, block: { height: number; hash: string } | null, tip: number): Promise<void> {
+  await tx(async c => {
+    const s = await lockSwap(c, swapId); if (!s || !s.btq_lock_txid) return;
+    const confs = block ? Math.max(0, tip - block.height + 1) : 0;
+    await reconcileEvidence(c, s, { btq_lock_height: block?.height ?? null, btq_lock_block_hash: block?.hash ?? null,
+      btq_lock_confs: confs }, 'btq_lock_confirmations', tip);
   });
 }
 
-export async function onBtqSpend(swapId: string, rawHex: string, spendTxid: string): Promise<void> {
-  await tx(async (c) => {
-    const s = await lockSwap(c, swapId);
-    if (!s || !s.btq_lock_txid || s.btq_lock_vout === null) return;
+export async function clearBtqObservation(swapId: string, leg: 'lock' | 'spend', tip?: number): Promise<void> {
+  await tx(async c => {
+    const s = await lockSwap(c, swapId); if (!s) return;
+    await releaseRecoveryAction(c, s, 'btq_claim'); await releaseRecoveryAction(c, s, 'btq_refund');
+    await reconcileEvidence(c, s, {
+      ...(leg === 'lock' ? { btq_lock_txid: null, btq_lock_vout: null, btq_lock_sats: null, btq_lock_height: null,
+        btq_lock_block_hash: null, btq_lock_confs: 0 } : {}),
+      btq_claim_txid: null, btq_refund_txid: null, btq_pending_spend_txid: null, btq_pending_spend_kind: null,
+      btq_spend_raw: null, btq_spend_height: null, btq_spend_block_hash: null,
+    }, `btq_${leg}_orphaned`, tip);
+  });
+}
+
+export async function onBtqSpend(swapId: string, rawHex: string, spendTxid: string, block: { height: number; hash: string; tip: number } | null = null, tip?: number): Promise<void> {
+  await tx(async c => {
+    const s = await lockSwap(c, swapId); if (!s || !s.btq_lock_txid || s.btq_lock_vout === null) return;
     const info = inspectHtlcSpend(rawHex, { txid: s.btq_lock_txid, vout: s.btq_lock_vout }, htlcForSwap(s));
-    if (!info) return;
-    if (info.kind === 'claim' && !s.btq_claim_txid) {
-      const preimage = bytesToHex(info.preimage!);
-      if (bytesToHex(sha256Bytes(info.preimage!)) !== s.secret_hash) return; // inspect already checks; belt and braces
-      if (['seller_lock_confirming', 'awaiting_buyer_claim', 'awaiting_refunds'].includes(s.status)) {
-        await transition(c, s.id, [s.status], 'awaiting_seller_claim', 'btq_claimed', { btq_claim_txid: spendTxid, revealed_preimage: preimage }, { txid: spendTxid });
-      } else {
-        await patch(c, s.id, { btq_claim_txid: spendTxid, revealed_preimage: s.revealed_preimage ?? preimage });
-        await recordEvent(c, s.id, 'btq_claimed', { txid: spendTxid, status: s.status });
-      }
-      return;
-    }
-    if (info.kind === 'refund' && !s.btq_refund_txid) {
-      if (s.status === 'awaiting_refunds' && (s.evm_refund_tx || !s.evm_agreement_id)) {
-        await transition(c, s.id, ['awaiting_refunds'], 'refunded', 'btq_refunded', { btq_refund_txid: spendTxid }, { txid: spendTxid });
-      } else {
-        await patch(c, s.id, { btq_refund_txid: spendTxid });
-        await recordEvent(c, s.id, 'btq_refunded', { txid: spendTxid, status: s.status });
-      }
-    }
+    if (!info || info.kind === 'unknown') return;
+    const confirmed = !!block && block.tip - block.height + 1 >= config().BTQ_MIN_CONFIRMATIONS;
+    await reconcileEvidence(c, s, {
+      btq_claim_txid: confirmed && info.kind === 'claim' ? spendTxid : null,
+      btq_refund_txid: confirmed && info.kind === 'refund' ? spendTxid : null,
+      btq_pending_spend_txid: confirmed ? null : spendTxid, btq_pending_spend_kind: confirmed ? null : info.kind,
+      btq_spend_raw: rawHex, btq_spend_height: block?.height ?? null, btq_spend_block_hash: block?.hash ?? null,
+      revealed_preimage: s.revealed_preimage ?? (info.kind === 'claim' ? bytesToHex(info.preimage!) : null),
+    }, confirmed ? `btq_${info.kind}_confirmed` : `btq_${info.kind}_pending`, block?.tip ?? tip);
   });
 }
 
@@ -534,9 +557,11 @@ export async function runDeadlines(tip: number, nowMs = Date.now()): Promise<num
     db(),
     `SELECT * FROM swaps WHERE
        (status = 'awaiting_buyer_lock' AND buyer_lock_by < to_timestamp($1 / 1000.0))
+    OR (status = 'buyer_lock_confirming' AND (evm_deadline IS NULL OR evm_deadline - ($3::text || ' seconds')::interval <= to_timestamp($1 / 1000.0)))
     OR (status = 'awaiting_seller_lock' AND seller_lock_by < to_timestamp($1 / 1000.0))
+    OR (status = 'awaiting_seller_claim' AND ((btq_refund_locktime <= $2 AND btq_claim_txid IS NULL) OR (evm_claim_tx IS NULL AND evm_deadline <= to_timestamp($1 / 1000.0))))
     OR (status IN ('awaiting_buyer_claim', 'seller_lock_confirming') AND btq_refund_locktime <= $2)`,
-    [nowMs, tip],
+    [nowMs, tip, sellerTimeBudgetSec() + 30],
   );
   for (const s of due) {
     await tx(async (c) => {
@@ -546,6 +571,9 @@ export async function runDeadlines(tip: number, nowMs = Date.now()): Promise<num
           changed++;
           await c.query('UPDATE users SET no_show_count = no_show_count + 1 WHERE id = $1 AND is_platform = false', [s.buyer_user_id]);
         }
+      } else if (s.status === 'buyer_lock_confirming') {
+        const r = await transition(c, s.id, ['buyer_lock_confirming'], s.btq_lock_txid ? 'awaiting_refunds' : 'awaiting_buyer_refund', 'buyer_confirmation_timeout', { failure_reason: 'the stablecoin lock did not confirm within its safe funding window' });
+        if (r) changed++;
       } else if (s.status === 'awaiting_seller_lock') {
         const r = await transition(c, s.id, ['awaiting_seller_lock'], 'awaiting_buyer_refund', 'seller_lock_window_passed', { failure_reason: 'seller did not lock BTQ in time' });
         if (r) {
@@ -553,7 +581,7 @@ export async function runDeadlines(tip: number, nowMs = Date.now()): Promise<num
           await c.query('UPDATE users SET no_show_count = no_show_count + 1 WHERE id = $1 AND is_platform = false', [s.seller_user_id]);
         }
       } else {
-        const r = await transition(c, s.id, ['awaiting_buyer_claim', 'seller_lock_confirming'], 'awaiting_refunds', 'btq_timelock_reached', { failure_reason: 'buyer did not claim BTQ before the timelock' }, { tip });
+        const r = await transition(c, s.id, ['awaiting_buyer_claim', 'seller_lock_confirming', 'awaiting_seller_claim'], 'awaiting_refunds', 'btq_timelock_reached', { failure_reason: 'buyer did not claim BTQ before the timelock' }, { tip });
         if (r) changed++;
       }
     });
