@@ -15,11 +15,11 @@ describe('desk session recovery (#12, #13)', () => {
     await deskApi.evmStart('0x123');
     expect(fetch.mock.calls[0]![1].headers.authorization).toBe(`Bearer ${token}`);
   });
-  it.each(['start', 'me'])('clears an expired session on %s, without retrying anonymously', async kind => {
+  it.each(['start', 'me', 'plan'])('clears an expired session on %s, without retrying anonymously', async kind => {
     saveDeskToken('a'.repeat(64));
     const fetch = vi.fn().mockResolvedValue(new Response('{"error":"Session expired"}', { status: 401 }));
     vi.stubGlobal('fetch', fetch);
-    await expect(kind === 'start' ? deskApi.evmStart('0x123') : deskApi.me()).rejects.toThrow('Session expired');
+    await expect(kind === 'start' ? deskApi.evmStart('0x123') : kind === 'plan' ? deskApi.plan(1) : deskApi.me()).rejects.toThrow('Session expired');
     expect(deskToken()).toBeNull();
     expect(fetch).toHaveBeenCalledTimes(1);
   });

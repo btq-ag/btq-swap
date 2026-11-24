@@ -1,3 +1,4 @@
+import { recoverSolanaLock } from '../domain/solana-transactions';
 import rateLimit from 'express-rate-limit';
 import { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
@@ -175,9 +176,9 @@ publicRoutes.post('/public/desk/swaps/:ref/sol/prepare', deskLimit, async (req, 
 
 publicRoutes.post('/public/desk/swaps/:ref/sol/submit', deskLimit, async (req, res, next) => {
   try {
-    await userFromToken(bearer(req.header('authorization')));
-    const body = z.object({ signedTx: z.string() }).parse(req.body);
-    res.json(await submitSolTx(body.signedTx));
+    const user = await userFromToken(bearer(req.header('authorization')));
+    const body = z.object({ preparationId: z.string().uuid(), signedTx: z.string().max(4096) }).parse(req.body);
+    res.json(await submitSolTx(user, String(req.params.ref), body.preparationId, body.signedTx));
   } catch (err) {
     next(err);
   }
@@ -248,4 +249,12 @@ publicRoutes.post('/public/desk/swaps/:ref/btq-lock', deskLimit, async (req, res
   } catch (err) {
     next(err);
   }
+});
+
+publicRoutes.post('/public/desk/swaps/:ref/sol/recover', deskLimit, async (req, res, next) => {
+  try {
+    const user = await userFromToken(bearer(req.header('authorization')));
+    const body = z.object({ signature: z.string().min(80).max(90) }).parse(req.body);
+    res.json(await recoverSolanaLock(user.id, String(req.params.ref), body.signature));
+  } catch (err) { next(err); }
 });

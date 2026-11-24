@@ -166,3 +166,15 @@ describe('instructions follow the settlement rail', async () => {
     expect(instructionFor(swap({ settlement_rail: 'evm', status: 'awaiting_seller_claim', revealed_preimage: 'ef'.repeat(32) }), 'seller').commands.join(' ')).toMatch(/evm claim/);
   });
 });
+
+
+describe('settlement presentation after lost confirmations', async () => {
+  const { protocolSteps } = await import('../src/domain/present');
+  it('does not display pending/orphaned funding or spends as confirmed because the secret is public', () => {
+    const steps=protocolSteps(swap({status:'awaiting_seller_claim',evm_agreement_id:'agreement',evm_lock_confs:0,
+      btq_lock_txid:'funding',btq_lock_confs:0,revealed_preimage:'ef'.repeat(32)}));
+    expect(steps.find(s=>s.key==='usdt_locked')!.state).not.toBe('done');
+    expect(steps.find(s=>s.key==='btq_locked')!.state).not.toBe('done');
+    expect(steps.find(s=>s.key==='btq_claimed')).toMatchObject({state:'active',label:'BTQ claim unconfirmed · secret public'});
+  });
+});

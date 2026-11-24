@@ -1,12 +1,11 @@
 import { getAddress } from 'ethers';
 import { randomBytes } from 'node:crypto';
 import nacl from 'tweetnacl';
-import { PublicKey, Transaction } from '@solana/web3.js';
+import { PublicKey } from '@solana/web3.js';
 import { btqNetworkTag, swapBindingAsset } from '@btq-swap/htlc';
 import { config } from '../config';
 import { evmChain } from '../chains/evm';
-import { buildHtlcTransaction } from '../chains/solana-htlc';
-import { solanaMint, solanaProgramId, withSolana } from '../chains/solana';
+import { prepareSolanaTransaction, submitSolanaTransaction, type SolanaAction } from './solana-transactions';
 import { sha256Hex } from '../lib/crypto';
 import { db, one, tx, type Queryable } from '../lib/db';
 import { takeOrder } from './book';
@@ -165,6 +164,7 @@ export async function deskTake(user: UserRow, orderNo: number, amountBtq: string
 
 export interface LockPlan {
   shortId: number;
+  rail: 'evm' | 'solana';
   status: string;
   role: 'buyer' | 'seller';
   evmLock: null | {
@@ -181,6 +181,7 @@ export interface LockPlan {
   btqSend: null | { address: string; amountSats: string; amountBtq: string };
   usdtClaim: null | { agreementId: string; preimage: string };
   usdtRefund: null | { agreementId: string };
+  btqClaim: boolean;
   solLock: boolean;
   solClaim: boolean;
   solRefund: boolean;
@@ -193,11 +194,11 @@ export async function lockPlan(user: UserRow, ref: string): Promise<LockPlan> {
   if (!swap) throw new DomainError('NOT_FOUND', 'No swap with that id.');
   const role = swap.buyer_user_id === user.id ? 'buyer' : swap.seller_user_id === user.id ? 'seller' : null;
   if (!role) throw new DomainError('NOT_FOUND', 'No swap with that id.');
-  const { htlc, token } = evmChain().addresses();
+  const htlc = swap.evm_htlc_contract; const token = swap.evm_token;
   const evmLock =
-    role === 'buyer' && swap.status === 'awaiting_buyer_lock'
+    role === 'buyer' && swap.status === 'awaiting_buyer_lock' && swap.settlement_rail === 'evm'
       ? {
-          chainId: config().EVM_CHAIN_ID,
+          chainId: swap.evm_chain_id,
           htlc,
           token,
           partyB: swap.seller_eth,
@@ -223,17 +224,19 @@ export async function lockPlan(user: UserRow, ref: string): Promise<LockPlan> {
   const sol = swap.settlement_rail === 'solana';
   return {
     shortId: Number(swap.short_id),
+    rail: swap.settlement_rail,
     status: swap.status,
     role,
     evmLock: sol ? null : evmLock,
     btqSend,
     usdtClaim: sol ? null : usdtClaim,
     usdtRefund: sol ? null : usdtRefund,
+    btqClaim: role === 'buyer' && ['awaiting_buyer_claim','awaiting_seller_claim'].includes(swap.status) && !!swap.btq_lock_txid && !swap.btq_claim_txid && !swap.btq_refund_txid,
     solLock: sol && role === 'buyer' && swap.status === 'awaiting_buyer_lock',
     solClaim: sol && !!usdtClaim,
     solRefund: sol && !!usdtRefund,
     contract: htlc,
-    chainId: config().EVM_CHAIN_ID,
+    chainId: swap.evm_chain_id,
   };
 }
 
@@ -316,54 +319,5 @@ export async function completeSol(address: string, signature: string, sessionUse
   });
 }
 
-export async function prepareSolTx(user: UserRow, ref: string, action: 'lock' | 'withdraw' | 'refund', secretHashHex?: string): Promise<{ tx: string }> {
-  const swap = await getSwap(ref);
-  if (!swap || swap.settlement_rail !== 'solana') throw new DomainError('NOT_FOUND', 'That swap is not on Solana.');
-  if (!swap.buyer_sol || !swap.seller_sol) throw new DomainError('VALIDATION', 'This swap has no Solana wallets.');
-  const buyerSol = swap.buyer_sol;
-  const sellerSol = swap.seller_sol;
-  const actor = action === 'withdraw' ? swap.seller_user_id : swap.buyer_user_id;
-  if (user.id !== actor) throw new DomainError('FORBIDDEN', 'This step belongs to the other party.');
-  let secretHash: Buffer;
-  let deadline: bigint;
-  let preimage: Buffer | undefined;
-  if (action === 'lock') {
-    if (!secretHashHex || !/^[0-9a-f]{64}$/i.test(secretHashHex)) throw new DomainError('VALIDATION', 'The secret hash must be 32 bytes of hex.');
-    secretHash = Buffer.from(secretHashHex, 'hex');
-    deadline = BigInt(Math.floor(Date.now() / 1000) + config().SWAP_EVM_LOCK_DURATION_SEC);
-  } else {
-    if (!swap.secret_hash || !swap.evm_deadline) throw new DomainError('CONFLICT', 'The Solana lock is not recorded yet.');
-    secretHash = Buffer.from(swap.secret_hash, 'hex');
-    deadline = BigInt(Math.floor(new Date(swap.evm_deadline).getTime() / 1000));
-    if (action === 'withdraw') {
-      if (!swap.revealed_preimage) throw new DomainError('CONFLICT', 'The secret is not public yet. Claim the BTQ first.');
-      preimage = Buffer.from(swap.revealed_preimage, 'hex');
-    }
-  }
-  const tx = await withSolana((connection) => buildHtlcTransaction({
-    connection,
-    programId: solanaProgramId(),
-    mint: solanaMint(),
-    feePayer: new PublicKey(action === 'withdraw' ? sellerSol : buyerSol),
-    action,
-    partyA: new PublicKey(buyerSol),
-    partyB: new PublicKey(sellerSol),
-    amount: BigInt(swap.amount_usdt_units),
-    secretHash,
-    deadline,
-    preimage,
-  }));
-  return { tx: tx.serialize({ requireAllSignatures: false, verifySignatures: false }).toString('base64') };
-}
-
-export async function submitSolTx(signedTx: string): Promise<{ signature: string }> {
-  const tx = Transaction.from(Buffer.from(signedTx, 'base64'));
-  const signature = await withSolana(async (connection) => {
-    const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false });
-    await connection.confirmTransaction(sig, 'confirmed');
-    return sig;
-  });
-  const { solanaTick } = await import('../workers/solana-watcher');
-  await solanaTick();
-  return { signature };
-}
+export const prepareSolTx = (user: UserRow, ref: string, action: SolanaAction, secretHashHex?: string) => prepareSolanaTransaction(user.id, ref, action, secretHashHex);
+export const submitSolTx = (user: UserRow, ref: string, preparationId: string, signedTx: string) => submitSolanaTransaction(user.id, ref, preparationId, signedTx);

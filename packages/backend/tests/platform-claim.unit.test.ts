@@ -3,14 +3,14 @@ import { bytesToHex, createHtlc, hashPreimage, signerFromSeed } from '@btq-swap/
 import type { SwapRow } from '../src/domain/types';
 
 const f = vi.hoisted(() => ({ rows: [] as SwapRow[], rpc: vi.fn(), tip: vi.fn(), broadcast: vi.fn(),
-  address: vi.fn(), claimAction: vi.fn(), signer: vi.fn(), htlc: vi.fn(), event: vi.fn(), query: vi.fn() }));
-vi.mock('../src/chains/btq', () => ({ btqChain: () => ({ rpc: { call: f.rpc }, tip: f.tip, broadcast: f.broadcast, platformAddress: f.address }) }));
-vi.mock('../src/chains/evm', () => ({ evmChain: () => ({ latestTimestamp: async () => 1_800_000_000 }) }));
+  wallet: vi.fn(), send: vi.fn(), previous: null as null | { metadata:{txid:string} }, withdraw: vi.fn(), address: vi.fn(), claimAction: vi.fn(), signer: vi.fn(), htlc: vi.fn(), event: vi.fn(), query: vi.fn() }));
+vi.mock('../src/chains/btq', () => ({ btqChain: () => ({ rpc: { call: f.rpc }, tip: f.tip, broadcast: f.broadcast, platformAddress: f.address, platform:{call:f.wallet},platformSend:f.send }) }));
+vi.mock('../src/chains/evm', () => ({ evmChain: () => ({ latestTimestamp: async () => 1_800_000_000, platformWithdraw:f.withdraw }) }));
 vi.mock('../src/domain/inventory', () => ({ refreshInventory: async () => {} }));
 vi.mock('../src/domain/identity', () => ({ getPlatformUser: async () => ({ id: 'platform' }) }));
 vi.mock('../src/domain/runtime', () => ({ platformHtlcSigner: f.signer }));
 vi.mock('../src/domain/settlement', () => ({ claimAction: f.claimAction, htlcForSwap: f.htlc, recordEvent: f.event }));
-vi.mock('../src/lib/db', () => ({ db: () => ({ query: f.query }), many: async () => f.rows, one: async () => ({ n: '0' }) }));
+vi.mock('../src/lib/db', () => ({ db: () => ({ query: f.query }), many: async () => f.rows, one: async (_q: unknown, sql: string) => sql.includes('platform_btq_lock') ? f.previous : { n:'0' } }));
 vi.mock('../src/lib/logger', () => ({ createLogger: () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn() }) }));
 vi.mock('../src/lib/crypto', () => ({ decryptSecret: () => Buffer.alloc(32, 7) }));
 vi.mock('../src/config', () => ({ config: () => ({ BTQ_MIN_CONFIRMATIONS: 6, BTQ_FEE_RATE_SAT_VB: 2, PLATFORM_SECRET_KEY: '' }) }));
@@ -23,7 +23,7 @@ describe('platform secret disclosure guard (#7)', () => {
     claimPubkey: signer.publicKey, refundPubkey: signer.publicKey, refundLocktime: 106 });
   const output = () => ({ bestblock: 'canonical', confirmations: 6, value: 1, scriptPubKey: { hex: bytesToHex(htlc.scriptPubKey) } });
   beforeEach(() => {
-    vi.resetAllMocks();
+    vi.resetAllMocks(); f.previous=null;
     f.rows = [{ id: 'swap', short_id: '1', buyer_user_id: 'platform', status: 'awaiting_buyer_claim',
       btq_lock_txid: 'ab'.repeat(32), btq_lock_vout: 0, btq_lock_sats: '100000000', btq_lock_confs: 999 } as SwapRow];
     f.rpc.mockResolvedValue(output()); f.tip.mockResolvedValue({ height: 100, hash: 'canonical' });
@@ -62,6 +62,23 @@ describe('platform secret disclosure guard (#7)', () => {
     expect(f.signer).not.toHaveBeenCalled(); expect(f.broadcast).not.toHaveBeenCalled();
     expect(f.query).toHaveBeenCalledWith(expect.stringContaining('DELETE FROM swap_events'), ['btq_claim:swap:0']);
     expect(f.event).not.toHaveBeenCalled();
+  });
+  it('retries a lost buyer claim even though its secret is already public', async () => {
+    Object.assign(f.rows[0]!,{status:'awaiting_seller_claim',revealed_preimage:'07'.repeat(32)});
+    await platformTick(100);expect(f.broadcast).toHaveBeenCalledTimes(1);
+  });
+  it('rebroadcasts original wallet funding without creating a second payment', async () => {
+    Object.assign(f.rows[0]!,{buyer_user_id:'buyer',seller_user_id:'platform',status:'awaiting_seller_lock',btq_lock_txid:null,btq_htlc_address:htlc.address});
+    f.previous={metadata:{txid:'funding'}};f.wallet.mockResolvedValue({hex:'original-transaction'});
+    await platformTick(100);expect(f.wallet).toHaveBeenCalledWith('gettransaction',['funding']);
+    expect(f.broadcast).toHaveBeenCalledWith('original-transaction');expect(f.send).not.toHaveBeenCalled();expect(f.claimAction).not.toHaveBeenCalled();
+  });
+  it.each(['refunded','expired'])('does not let a %s stablecoin claim shadow a BTQ refund', async scenario => {
+    Object.assign(f.rows[0]!,{buyer_user_id:'buyer',seller_user_id:'platform',status:'awaiting_refunds',revealed_preimage:'07'.repeat(32),
+      evm_agreement_id:'agreement',evm_deadline:new Date((scenario==='expired'?1_799_999_999:1_800_000_100)*1000),
+      evm_refund_tx:scenario==='refunded'?'refunded':null,btq_refund_locktime:106});
+    await platformTick(106);expect(f.withdraw).not.toHaveBeenCalled();expect(f.broadcast).toHaveBeenCalledTimes(1);
+    expect(f.event).toHaveBeenCalledWith(expect.anything(),'swap','platform_btq_refund',expect.anything(),expect.anything());
   });
   it('does not spend broadcast attempts on wallet address RPC failures', async () => {
     f.address.mockRejectedValue(new Error('wallet unavailable'));

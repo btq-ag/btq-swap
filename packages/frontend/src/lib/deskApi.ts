@@ -25,12 +25,14 @@ export interface TakenSwap {
 
 export interface LockPlan {
   shortId: number;
+  rail: 'evm' | 'solana';
   status: string;
   role: 'buyer' | 'seller';
   evmLock: EvmLock | null;
   btqSend: { address: string; amountSats: string; amountBtq: string } | null;
   usdtClaim: { agreementId: string; preimage: string } | null;
   usdtRefund: { agreementId: string } | null;
+  btqClaim: boolean;
   solLock: boolean;
   solClaim: boolean;
   solRefund: boolean;
@@ -76,11 +78,15 @@ export const deskApi = {
   btqStart: () => post<{ challengeId: string; challenge: string; expiresAt: string }>('/public/desk/btq/start', {}, true),
   btqFinish: (proof: BtqProof, challengeId: string) => post<{ profile: DeskProfile }>('/public/desk/btq/finish', { ...proof, challengeId }, true),
   take: (orderNo: number, amountBtq: string) => post<TakenSwap>('/public/desk/take', { orderNo, amountBtq }, true),
-  plan: (ref: number | string) => getJson<LockPlan>(`/public/desk/swaps/${ref}/plan`, { headers: authHeaders() }),
+  plan: (ref: number | string) => getJson<LockPlan>(`/public/desk/swaps/${ref}/plan`, { headers: authHeaders() }).catch((error: unknown) => {
+    if (error instanceof ApiError && error.status === 401) clearDeskToken();
+    throw error;
+  }),
   btqLock: (ref: number | string, txid: string) => post<{ ok: boolean }>(`/public/desk/swaps/${ref}/btq-lock`, { txid }, true),
   solStart: (address: string) => post<{ challengeId: string; message: string; profile: DeskProfile }>('/public/desk/sol/start', { address, acceptTos: true }, !!deskToken()),
   solFinish: (address: string, signature: string, challengeId: string) => post<{ token?: string; profile: DeskProfile }>('/public/desk/sol/finish', { address, signature, challengeId }, !!deskToken()),
   solPrepare: (ref: number | string, action: 'lock' | 'withdraw' | 'refund', secretHash?: string) =>
-    post<{ tx: string }>(`/public/desk/swaps/${ref}/sol/prepare`, { action, secretHash }, true),
-  solSubmit: (ref: number | string, signedTx: string) => post<{ signature: string }>(`/public/desk/swaps/${ref}/sol/submit`, { signedTx }, true),
+    post<{ tx: string; preparationId: string; signed: boolean }>(`/public/desk/swaps/${ref}/sol/prepare`, { action, secretHash }, true),
+  solRecover: (ref: number | string, signature: string) => post<{ agreementId: string }>(`/public/desk/swaps/${ref}/sol/recover`, { signature }, true),
+  solSubmit: (ref: number | string, preparationId: string, signedTx: string) => post<{ signature: string }>(`/public/desk/swaps/${ref}/sol/submit`, { preparationId, signedTx }, true),
 };

@@ -62,4 +62,13 @@ describe.skipIf(!databaseEnabled)('funding identity and recovery (#10, #15)', ()
     expect((await getSwap(other.id))!.btq_lock_txid).toBeNull();
     expect((await getSwap(s.id))!.btq_lock_vout).toBe(1);
   });
+  it('arbitrates concurrent claims to one physical BTQ outpoint', async () => {
+    const swaps=await Promise.all([0,1].map(()=>testSwap({status:'awaiting_seller_lock',secret_hash:newPreimage().secretHashHex,btq_refund_locktime:200})));
+    const output={txid:'fe'.repeat(32),vout:0,sats:100_000_000n,height:null};
+    await Promise.all(swaps.map(s=>onBtqLockOutput(s.id,output,100)));
+    const saved=await Promise.all(swaps.map(s=>getSwap(s.id)));
+    expect(saved.filter(s=>s!.btq_lock_txid===output.txid)).toHaveLength(1);
+    expect((await db().query("SELECT * FROM swap_locks WHERE chain='btq' AND lock_id=$1",[`${output.txid}:0`])).rows).toHaveLength(1);
+  });
+
 });

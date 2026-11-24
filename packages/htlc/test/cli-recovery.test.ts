@@ -14,6 +14,7 @@ describe('CLI scoped secrets and rejected BTQ refunds (#10, #11)', () => {
   const id = '11111111-2222-3333-4444-555555555555';
   const outpoint = 'ab'.repeat(32) + ':3';
   beforeEach(() => {
+    vi.stubEnv('BTQ_RPC_URL', '');
     home = mkdtempSync(join(tmpdir(), 'btq-cli-test-'));
     writeFileSync(join(home, 'key.json'), JSON.stringify({ seed: '02'.repeat(32) }));
     descriptor = { swap: { id, shortId: 1, status: 'awaiting_buyer_refund', network:'regtest', amountSats:'100000000', amountBtq:'1' },
@@ -26,7 +27,7 @@ describe('CLI scoped secrets and rejected BTQ refunds (#10, #11)', () => {
         { value:0.1, scriptPubKey:{ hex:bytesToHex(htlc.scriptPubKey) } } }));
     }));
   });
-  afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); rmSync(home, { recursive:true,force:true }); });
+  afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.unstubAllEnvs(); rmSync(home, { recursive:true,force:true }); });
   const args = () => ['--home',home,'--api','https://desk.example/api','--swap','1'];
   it('resolves short and UUID aliases to one file and refuses silent reuse', async () => {
     await main(['secret','new',...args()]);

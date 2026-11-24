@@ -19,7 +19,8 @@ export async function rememberLock(c: Queryable, s: SwapRow, chain: 'evm' | 'btq
   const network = chain === 'btq' ? s.btq_network : `${s.evm_chain_id}:${s.evm_htlc_contract}`;
   const result = await c.query(`INSERT INTO swap_locks (chain, network, lock_id, swap_id, reason, metadata)
     VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (chain, network, lock_id)
-    DO UPDATE SET metadata = swap_locks.metadata || EXCLUDED.metadata, reason = EXCLUDED.reason
+    DO UPDATE SET metadata = swap_locks.metadata || EXCLUDED.metadata || jsonb_build_object('accepted',
+      swap_locks.reason IS NULL OR EXCLUDED.reason IS NULL OR COALESCE((swap_locks.metadata->>'accepted')::boolean, false)), reason = EXCLUDED.reason
     WHERE swap_locks.swap_id = EXCLUDED.swap_id RETURNING swap_id`,
   [chain, network, lockId.toLowerCase(), s.id, reason, JSON.stringify(metadata, (_, v) => typeof v === 'bigint' ? v.toString() : v)]);
   return result.rows.length === 1;

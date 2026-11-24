@@ -1,3 +1,4 @@
+import { config } from '../config';
 import type { SwapRow, SwapStatus, UserRow } from './types';
 
 export type StepState = 'done' | 'active' | 'pending' | 'skipped' | 'failed';
@@ -24,7 +25,7 @@ const REFUND_STATES: SwapStatus[] = ['awaiting_buyer_refund', 'awaiting_refunds'
 export function protocolSteps(s: SwapRow): StepView[] {
   const st = s.status;
   const usdtLocked = !!s.evm_agreement_id;
-  const usdtConfirmed = usdtLocked && !['buyer_lock_confirming'].includes(st);
+  const usdtConfirmed = usdtLocked && s.evm_lock_confs >= config().EVM_MIN_CONFIRMATIONS;
   const btqLocked = !!s.btq_lock_txid;
   const btqClaimed = !!s.btq_claim_txid;
   const usdtClaimed = !!s.evm_claim_tx;
@@ -37,8 +38,8 @@ export function protocolSteps(s: SwapRow): StepView[] {
   const steps: StepView[] = [
     step('matched', 'Matched', true, false),
     step('usdt_locked', usdtConfirmed || !usdtLocked ? 'USDT locked' : 'USDT locked (confirming)', usdtConfirmed, st === 'awaiting_buyer_lock' || st === 'buyer_lock_confirming', s.evm_lock_tx),
-    step('btq_locked', 'BTQ locked', btqLocked && st !== 'seller_lock_confirming', st === 'awaiting_seller_lock' || st === 'seller_lock_confirming', s.btq_lock_txid),
-    step('btq_claimed', 'BTQ claimed · secret revealed', btqClaimed, st === 'awaiting_buyer_claim', s.btq_claim_txid),
+    step('btq_locked', 'BTQ locked', btqLocked && s.btq_lock_confs >= config().BTQ_MIN_CONFIRMATIONS, st === 'awaiting_seller_lock' || st === 'seller_lock_confirming', s.btq_lock_txid),
+    step('btq_claimed', s.revealed_preimage && !btqClaimed ? 'BTQ claim unconfirmed · secret public' : 'BTQ claimed · secret revealed', btqClaimed, st === 'awaiting_buyer_claim' || (!!s.revealed_preimage && !btqClaimed), s.btq_claim_txid),
     step('usdt_claimed', 'USDT claimed', usdtClaimed, st === 'awaiting_seller_claim', s.evm_claim_tx),
     step('done', st === 'completed' ? 'Completed' : 'Settled', st === 'completed', false),
   ];
